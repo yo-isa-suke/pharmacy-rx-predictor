@@ -1,7 +1,53 @@
 """
 薬局 年間処方箋枚数 多面的予測ツール v3.2
 ==========================================
-v3.1 からの改善点（競合薬局データ・シェアロジック強化）:
+v3.2（外来患者数精度改善・医療機関密集補正）:
+  ★ 医療機関密集エリアでの過大推計を修正（国立市中1丁目などの医療ゾーン対応）
+
+  1. デフォルト外来患者数を実態に合わせて引き下げ
+     【根拠】厚生労働省「医療施設調査」2020年: 無床一般診療所の1日平均外来患者数 ≈ 22人/日
+     MHLWで外来患者数が確認できないクリニック（小規模・新規・データ未掲載）は
+     全国平均以下の可能性が高いため、より保守的なデフォルト値に変更。
+       OSMのみ取得クリニック（医師数不明）: 35 → 20人/日
+       OSMのみ取得クリニック（医師2名）:     60 → 40人/日
+       OSMのみ取得クリニック（医師3名以上）: 100 → 70人/日
+       MHLW補填クリニック（外来数不明）:      40 → 20人/日
+
+  2. 医療機関密集補正（apply_clinic_congestion_factor 新設）
+     MHLW外来患者数未確認のデフォルト値施設が密集している場合、
+     患者が分散する実態を反映して外来患者数に補正係数を適用。
+       6〜9件:  ×0.85（15%圧縮）
+       10〜14件: ×0.70（30%圧縮）
+       15〜19件: ×0.60（40%圧縮）
+       20件以上: ×0.50（50%圧縮）
+     ※ 手動入力施設・MHLW確認済み施設は補正対象外（実データ優先）
+
+v3.2 旧Changelog（競合薬局データ・シェアロジック強化）:
+  1. 競合薬局の処方箋枚数を自動取得（常時実行）
+     既存薬局分析モード・新規開局予測モード両方で、近隣薬局の処方箋枚数を
+     分析実行時に自動でMHLWから取得（上位10薬局）。
+     マップのポップアップ・競合薬局テーブルに自動反映。
+     （旧: 新規開局モードのみ・チェックボックスON時のみ取得）
+  2. 競合薬局のOSM検索タグを拡充
+     amenity=pharmacy に加え shop=pharmacy / healthcare=pharmacy タグも取得。
+     日本のOSMで混在するタグ形式に対応し、漏れを大幅削減。
+     最小検索半径を 600m → 800m に拡大（競合影響圏を広くカバー）。
+  3. シェアロジックをより現実的な計算式に修正（方法①・方法②）
+     【方法①_calc_share 変更】医療機関の50m以内に競合薬局が既に存在する場合、
+     その競合薬局を「既存門前薬局」と動的に判定してベースシェアを大幅割引。
+     従来の固定 has_gate_pharmacy ×0.4 フラグを廃止し動的判定に変更。
+     【方法②_market_share 変更】医療機関の100m以内にいる競合薬局（門前的競合）
+     の実効競合数重みを ×1.5→×2.5 に強化（シェアをより保守的な推計に）。
+
+v3.1 の内容（前バージョン）:
+  - 院外処方率 79.0%、処方箋発行率 69%、方法②シェア上限 80% に更新
+  - MHLW医療機関自動補填を初回分析時から自動実行
+v2.6 の内容:
+  - MHLW医療機関データベース エリア自動補填機能追加
+v2.5 の内容:
+  - 新規開局シナリオ全面再設計（B/C/A/全比較）
+v2.4 の内容:
+  - OSM未収録クリニックの手動追加＋再計算機能
   1. 競合薬局の処方箋枚数を自動取得（常時実行）
      既存薬局分析モード・新規開局予測モード両方で、近隣薬局の処方箋枚数を
      分析実行時に自動でMHLWから取得（上位10薬局）。
@@ -729,9 +775,12 @@ out center tags;
             if beds >= 100: return 400
             return 150
         doctors = int(tags.get("staff:count", 0) or 0)
-        if doctors >= 3: return 100
-        if doctors >= 2: return 60
-        return 35
+        # 厚生労働省「医療施設調査」2020年: 無床一般診療所の1日平均外来患者数は約22人/日（全国平均）。
+        # OSMのみで取得されたクリニック（MHLW確認なし）は小規模・新規の可能性が高く
+        # 全国平均より少ない実態に合わせて控えめな値を採用。
+        if doctors >= 3: return 70   # 旧: 100（複数医師クリニック）
+        if doctors >= 2: return 40   # 旧: 60（2医師クリニック）
+        return 20                    # 旧: 35（単科・個人クリニック中央値に近い値）
 
 
 # ---------------------------------------------------------------------------
@@ -1068,6 +1117,65 @@ class MHLWScraper:
             return None, "外来患者数の記載なし"
         except Exception as e:
             return None, f"取得エラー: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 5-pre. 医療機関密集補正ユーティリティ
+# ---------------------------------------------------------------------------
+
+def apply_clinic_congestion_factor(
+    facilities: List["NearbyFacility"],
+    log: Optional[List[str]] = None,
+) -> List["NearbyFacility"]:
+    """
+    医療機関が密集しているエリアでは、クリニック1件あたりの患者数が分散する。
+    MHLWで外来患者数が確認されていない（デフォルト値を持つ）施設に補正係数を適用する。
+
+    ■ 根拠:
+      医療機関が多いエリアは「患者を奪い合う競争環境」であり、1件あたりの平均患者数が
+      全国平均より少ない。例えば国立市中1丁目のような医療モールエリアでは10件以上の
+      クリニックが集中するため、個々の患者数は大きく下がる。
+
+    ■ 補正係数テーブル（MHLW外来確認済み施設は対象外）:
+      5件以下: ×1.00（補正なし）
+      6〜9件:  ×0.85
+      10〜14件: ×0.70
+      15〜19件: ×0.60
+      20件以上: ×0.50
+    """
+    # MHLW外来患者数未確認のデフォルト値施設のみカウント
+    # ・OSM取得施設（is_manual=False, source="osm"）→ 対象
+    # ・MHLW補填施設（is_manual=True,  source="mhlw"）→ 対象（外来数未確認のデフォルト値）
+    # ・ユーザー手動入力施設（is_manual=True, source="osm"）→ 対象外（ユーザー入力値を尊重）
+    unconfirmed = [
+        f for f in facilities
+        if f.mhlw_annual_outpatients is None
+        and not (f.is_manual and f.source != "mhlw")
+    ]
+    n = len(unconfirmed)
+
+    if n < 6:
+        return facilities  # 補正不要
+
+    if n < 10:
+        factor = 0.85
+    elif n < 15:
+        factor = 0.70
+    elif n < 20:
+        factor = 0.60
+    else:
+        factor = 0.50
+
+    for f in unconfirmed:
+        orig = f.daily_outpatients
+        f.daily_outpatients = max(5, int(f.daily_outpatients * factor))
+
+    if log is not None:
+        log.append(
+            f"[密集補正] MHLW外来未確認施設{n}件 → 密集係数×{factor:.2f}を適用"
+            f"（外来患者数を{1/factor:.1f}分の1に圧縮）"
+        )
+    return facilities
 
 
 # ---------------------------------------------------------------------------
@@ -1762,8 +1870,10 @@ def fetch_mhlw_medical_supplement(
         is_hospital = any(kw in cand.name for kw in ["病院", "医療センター", "医療機構", "医院"])
         fac_type    = "hospital" if is_hospital else "clinic"
         specialty   = detect_specialty_from_name(cand.name)
-        # デフォルト外来患者数: 病院150人/日、クリニック40人/日
-        default_op  = 120 if fac_type == "hospital" else 40
+        # デフォルト外来患者数: 病院120人/日、クリニック20人/日
+        # MHLWでリストされているが外来患者数の詳細が取れないクリニックは
+        # 小〜中規模の可能性が高いため、全国平均（22人/日）より若干低い20人/日を採用。
+        default_op  = 120 if fac_type == "hospital" else 20
 
         new_facilities.append(NearbyFacility(
             name=cand.name,
@@ -2135,8 +2245,8 @@ def render_gap_and_manual_input(analysis: "FullAnalysis") -> None:
             mhlw_dist    = col_a.number_input("距離(m)", 1, 2000, 30, step=5, key="mhlw_dist_v4")
             mhlw_sp      = col_b.selectbox("診療科", list(SPECIALTY_RX_RATES.keys()),
                                            key="mhlw_sp_v4")
-            mhlw_op      = col_c.number_input("外来患者数/日", 1, 500, 40, key="mhlw_op_v4",
-                                              help="MHLW取得ボタンで自動取得を試みることもできます（デフォルト40人/日: 一般的な個人クリニックの中央値）")
+            mhlw_op      = col_c.number_input("外来患者数/日", 1, 500, 20, key="mhlw_op_v4",
+                                              help="MHLW取得ボタンで自動取得を試みることもできます（デフォルト20人/日: 厚労省「医療施設調査」の無床診療所平均22人/日に準じた値）")
             mhlw_inhouse = col_d.checkbox("院内薬局あり", key="mhlw_inhouse_v4")
 
             col_fetch, col_add = st.columns(2)
@@ -2982,6 +3092,9 @@ def run_analysis(candidate: PharmacyCandidate, try_mhlw_medical: bool = False) -
                    + (f" + 手動 {len(manual_facs)}件" if manual_facs else "")
                    + f" = 合計 {len(merged_medical)}件")
 
+    # 医療機関密集補正: デフォルト外来患者数を持つ施設が多い場合、患者分散を反映
+    merged_medical = apply_clinic_congestion_factor(merged_medical, log)
+
     extra_label = []
     if mhlw_facs_for_pred: extra_label.append(f"MHLW補填{len(mhlw_facs_for_pred)}件含む")
     if manual_facs:        extra_label.append(f"手動追加{len(manual_facs)}件含む")
@@ -3090,6 +3203,9 @@ def run_new_pharmacy_analysis(config: NewPharmacyConfig) -> None:
             if new_facs:
                 nearby_medical = nearby_medical + new_facs
                 log.append(f"[MHLW補填] {len(new_facs)}件を近隣医療機関に追加")
+
+        # 医療機関密集補正: デフォルト外来患者数を持つ施設が多い場合、患者分散を反映
+        nearby_medical = apply_clinic_congestion_factor(nearby_medical, log)
 
     # D: 商圏半径確定
     progress.progress(65, text="[4/5] 門前判定・商圏半径を確定中…")
