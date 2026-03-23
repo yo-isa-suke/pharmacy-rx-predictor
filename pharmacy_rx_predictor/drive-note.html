@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f0f11">
+  <title>Drive Note</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f11;
+      --surface: #1c1c1f;
+      --surface2: #252529;
+      --border: #2e2e33;
+      --text: #f2f2f5;
+      --text-dim: #888890;
+      --accent: #4f9eff;
+      --accent-soft: rgba(79, 158, 255, 0.15);
+      --accent-border: rgba(79, 158, 255, 0.25);
+      --red: #ff5555;
+      --red-soft: rgba(255, 85, 85, 0.15);
+      --green: #50cc88;
+      --green-soft: rgba(80, 204, 136, 0.15);
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Yu Gothic', sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-text-size-adjust: 100%;
+      overscroll-behavior: none;
+    }
+
+    /* ──────────── SCREENS ──────────── */
+    .screen {
+      display: none;
+      flex-direction: column;
+      height: 100%;
+      padding: calc(var(--safe-top) + 16px) 20px calc(var(--safe-bottom) + 16px);
+      max-width: 480px;
+      margin: 0 auto;
+    }
+    .screen.active { display: flex; }
+
+    /* ──────────── HEADER ──────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 16px;
+      flex-shrink: 0;
+    }
+    .app-name {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+      color: var(--text-dim);
+    }
+    .step-counter {
+      font-size: 13px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ──────────── PROGRESS BAR ──────────── */
+    .progress-track {
+      height: 3px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+      flex-shrink: 0;
+      margin-bottom: 28px;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    /* ──────────── SCROLLABLE CONTENT ──────────── */
+    .scroll-area {
+      flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      padding-bottom: 8px;
+    }
+
+    /* ──────────── WELCOME ──────────── */
+    .welcome-hero {
+      text-align: center;
+      padding: 24px 0 8px;
+    }
+    .welcome-emoji {
+      font-size: 52px;
+      display: block;
+      margin-bottom: 16px;
+    }
+    .welcome-title {
+      font-size: 26px;
+      font-weight: 800;
+      line-height: 1.35;
+      margin-bottom: 10px;
+    }
+    .welcome-sub {
+      font-size: 14px;
+      color: var(--text-dim);
+      line-height: 1.7;
+    }
+
+    .steps-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .step-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .step-badge {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .step-row span {
+      font-size: 14px;
+      color: var(--text-dim);
+      line-height: 1.65;
+    }
+    .step-row strong {
+      color: var(--text);
+    }
+
+    .notice {
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      border-radius: 12px;
+      padding: 13px 15px;
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.65;
+    }
+
+    /* ──────────── QUESTION ──────────── */
+    .q-tag {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .q-text {
+      font-size: 21px;
+      font-weight: 700;
+      line-height: 1.5;
+    }
+
+    .transcript-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 16px;
+      transition: border-color 0.2s;
+      position: relative;
+    }
+    .transcript-card.focus {
+      border-color: var(--accent);
+    }
+    textarea {
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1.75;
+      width: 100%;
+      resize: none;
+      font-family: inherit;
+      min-height: 110px;
+      caret-color: var(--accent);
+    }
+    textarea::placeholder { color: var(--text-dim); }
+
+    /* ──────────── MIC BUTTON ──────────── */
+    .mic-zone {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+    .mic-btn {
+      width: 76px;
+      height: 76px;
+      border-radius: 50%;
+      border: none;
+      background: var(--accent);
+      color: white;
+      font-size: 28px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.15s, box-shadow 0.15s, background 0.2s;
+      box-shadow: 0 4px 20px rgba(79, 158, 255, 0.35);
+    }
+    .mic-btn:active { transform: scale(0.93); }
+    .mic-btn.recording {
+      background: var(--red);
+      box-shadow: 0 4px 20px rgba(255, 85, 85, 0.35);
+      animation: ring 1.6s infinite;
+    }
+    @keyframes ring {
+      0%   { box-shadow: 0 0 0 0 rgba(255,85,85,0.5); }
+      70%  { box-shadow: 0 0 0 18px rgba(255,85,85,0); }
+      100% { box-shadow: 0 0 0 0 rgba(255,85,85,0); }
+    }
+    .mic-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-align: center;
+    }
+    .mic-label.recording { color: var(--red); }
+
+    /* ──────────── BUTTONS ──────────── */
+    .btn-row {
+      display: flex;
+      gap: 10px;
+    }
+    .btn {
+      flex: 1;
+      padding: 15px 10px;
+      border-radius: 14px;
+      border: none;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      display: block;
+      transition: transform 0.12s, opacity 0.12s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:active { transform: scale(0.96); opacity: 0.9; }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-ghost {
+      background: var(--surface);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .btn-danger-soft {
+      background: transparent;
+      color: var(--text-dim);
+      font-size: 13px;
+      padding: 12px;
+      text-align: center;
+      cursor: pointer;
+      border: none;
+      width: 100%;
+    }
+    .btn-green { background: var(--green); color: #0f1a13; }
+
+    /* ──────────── FINAL SCREEN ──────────── */
+    .final-badge {
+      background: var(--green-soft);
+      border: 1px solid rgba(80, 204, 136, 0.25);
+      border-radius: 14px;
+      padding: 16px 18px;
+    }
+    .final-badge-title {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--green);
+      margin-bottom: 4px;
+    }
+    .final-badge-sub {
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.65;
+    }
+    .prompt-preview {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 16px;
+      max-height: 220px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      font-size: 12.5px;
+      color: var(--text-dim);
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .copy-toast {
+      display: none;
+      background: var(--green-soft);
+      border: 1px solid rgba(80,204,136,0.25);
+      border-radius: 10px;
+      padding: 11px 14px;
+      font-size: 13px;
+      color: var(--green);
+      text-align: center;
+    }
+    .copy-toast.show { display: block; }
+
+    /* divider */
+    .divider {
+      height: 1px;
+      background: var(--border);
+      border-radius: 1px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════ WELCOME SCREEN ═══════════ -->
+<div id="s-welcome" class="screen active">
+  <div class="header">
+    <span class="app-name">🚗 Drive Note</span>
+  </div>
+  <div class="scroll-area">
+    <div class="welcome-hero">
+      <span class="welcome-emoji">🎙️</span>
+      <div class="welcome-title">運転しながら<br>note記事を作ろう</div>
+      <div class="welcome-sub">音声で答えるだけ。思考が記事になる。</div>
+    </div>
+
+    <div class="steps-card">
+      <div class="step-row">
+        <div class="step-badge">1</div>
+        <span>マイクボタンを押して、<strong>今考えていることを自由に話す</strong></span>
+      </div>
+      <div class="step-row">
+        <div class="step-badge">2</div>
+        <span>AIが用意した<strong>8つの深掘り質問</strong>に音声で答える</span>
+      </div>
+      <div class="step-row">
+        <div class="step-badge">3</div>
+        <span>生成した<strong>プロンプトをコピー</strong>して Claude.ai に貼り付ける</span>
+      </div>
+      <div class="step-row">
+        <div class="step-badge">4</div>
+        <span>YOSUKEさんらしい<strong>note記事が完成！</strong></span>
+      </div>
+    </div>
+
+    <div class="notice">
+      💡 Safariの「マイクへのアクセス」を許可してください。音声が使えない場合は、テキストで入力することもできます。
+    </div>
+
+    <button class="btn btn-primary" style="margin-top: 4px;" onclick="startSession()">はじめる →</button>
+  </div>
+</div>
+
+<!-- ═══════════ QUESTION SCREEN ═══════════ -->
+<div id="s-question" class="screen">
+  <div class="header">
+    <span class="app-name">🚗 Drive Note</span>
+    <span class="step-counter" id="step-counter">1 / 8</span>
+  </div>
+  <div class="progress-track">
+    <div class="progress-bar" id="progress-bar" style="width: 12.5%;"></div>
+  </div>
+  <div class="scroll-area">
+    <div>
+      <div class="q-tag" id="q-tag">思考ダンプ</div>
+      <div class="q-text" id="q-text">今、気になっていること・考えていることを自由に話してください。整っていなくて大丈夫です。</div>
+    </div>
+
+    <div class="transcript-card" id="transcript-card">
+      <textarea
+        id="answer-input"
+        placeholder="ここに文字起こしが表示されます。直接入力もできます。"
+        rows="5"
+        onfocus="document.getElementById('transcript-card').classList.add('focus')"
+        onblur="document.getElementById('transcript-card').classList.remove('focus')"
+      ></textarea>
+    </div>
+
+    <div class="mic-zone">
+      <button class="mic-btn" id="mic-btn" onclick="toggleRecording()">🎙️</button>
+      <div class="mic-label" id="mic-label">タップして録音</div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="btn-back" onclick="prevStep()" style="display:none;">← 戻る</button>
+      <button class="btn btn-primary" id="btn-next" onclick="nextStep()">次へ →</button>
+    </div>
+    <button class="btn-danger-soft" onclick="skipStep()">この質問をスキップ</button>
+  </div>
+</div>
+
+<!-- ═══════════ FINAL SCREEN ═══════════ -->
+<div id="s-final" class="screen">
+  <div class="header">
+    <span class="app-name">🚗 Drive Note</span>
+  </div>
+  <div class="scroll-area">
+    <div class="final-badge">
+      <div class="final-badge-title">✅ 対話完了！</div>
+      <div class="final-badge-sub">プロンプトをコピーして Claude.ai に貼り付けると、note記事が完成します。</div>
+    </div>
+
+    <div>
+      <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 8px;">生成されたプロンプト（プレビュー）</div>
+      <div class="prompt-preview" id="prompt-preview"></div>
+    </div>
+
+    <button class="btn btn-green" onclick="copyPrompt()" style="font-size: 16px; padding: 18px;">📋 プロンプトをコピー</button>
+    <div class="copy-toast" id="copy-toast">✓ コピーしました！Claude.ai を開いて貼り付けてください。</div>
+
+    <a href="https://claude.ai" target="_blank" class="btn btn-ghost" style="text-align:center; text-decoration:none; display:block; padding:16px;">
+      Claude.ai を開く →
+    </a>
+
+    <div class="divider"></div>
+
+    <button class="btn-danger-soft" onclick="resetApp()">最初からやり直す</button>
+  </div>
+</div>
+
+<script>
+  // ─── QUESTIONS ───────────────────────────────────────────────────────────────
+  const QUESTIONS = [
+    {
+      tag: '思考ダンプ',
+      text: '今、気になっていること・考えていることを自由に話してください。整っていなくて大丈夫です。'
+    },
+    {
+      tag: '具体的な場面',
+      text: 'それは具体的にどんな場面・状況でのことでしたか？何があったか教えてください。'
+    },
+    {
+      tag: '感情・感覚',
+      text: 'そのとき、どんな気持ちや感情が湧き上がりましたか？正直に教えてください。'
+    },
+    {
+      tag: '行動・反応',
+      text: 'それに対して、実際どう行動しましたか？または何をしようと思いましたか？'
+    },
+    {
+      tag: '価値観・なぜ？',
+      text: 'なぜそう感じたと思いますか？自分の中のどんな価値観と関係していそうですか？'
+    },
+    {
+      tag: '普遍化',
+      text: 'これをビジネス全般、または人生に当てはめるとどう言えると思いますか？'
+    },
+    {
+      tag: '読者へのメッセージ',
+      text: 'この気づきを一言で表すなら？読者に一番持ち帰ってほしいメッセージは何ですか？'
+    },
+    {
+      tag: 'これからの行動',
+      text: 'この体験・気づきを通じて、自分の考えや行動は何か変わりましたか？これからどうしたいですか？'
+    }
+  ];
+
+  // ─── STATE ────────────────────────────────────────────────────────────────────
+  let currentStep = 0;
+  let answers = Array(QUESTIONS.length).fill('');
+  let recognition = null;
+  let isRecording = false;
+
+  // ─── NAVIGATION ───────────────────────────────────────────────────────────────
+  function showScreen(id) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  function startSession() {
+    currentStep = 0;
+    answers = Array(QUESTIONS.length).fill('');
+    showScreen('s-question');
+    renderStep();
+  }
+
+  function saveCurrentAnswer() {
+    answers[currentStep] = (document.getElementById('answer-input').value || '').trim();
+  }
+
+  function renderStep() {
+    stopRecording();
+    const q = QUESTIONS[currentStep];
+    document.getElementById('q-tag').textContent = q.tag;
+    document.getElementById('q-text').textContent = q.text;
+    document.getElementById('answer-input').value = answers[currentStep] || '';
+    document.getElementById('step-counter').textContent = `${currentStep + 1} / ${QUESTIONS.length}`;
+    document.getElementById('progress-bar').style.width = `${((currentStep + 1) / QUESTIONS.length) * 100}%`;
+
+    const isLast = currentStep === QUESTIONS.length - 1;
+    document.getElementById('btn-next').textContent = isLast ? '記事を生成 ✨' : '次へ →';
+    document.getElementById('btn-back').style.display = currentStep === 0 ? 'none' : 'flex';
+  }
+
+  function nextStep() {
+    saveCurrentAnswer();
+    if (currentStep === QUESTIONS.length - 1) {
+      buildPromptAndFinish();
+    } else {
+      currentStep++;
+      renderStep();
+    }
+  }
+
+  function prevStep() {
+    saveCurrentAnswer();
+    if (currentStep > 0) { currentStep--; renderStep(); }
+  }
+
+  function skipStep() {
+    answers[currentStep] = '';
+    if (currentStep === QUESTIONS.length - 1) {
+      buildPromptAndFinish();
+    } else {
+      currentStep++;
+      renderStep();
+    }
+  }
+
+  function resetApp() {
+    stopRecording();
+    showScreen('s-welcome');
+  }
+
+  // ─── PROMPT GENERATION ────────────────────────────────────────────────────────
+  function buildPromptAndFinish() {
+    const qaPairs = QUESTIONS.map((q, i) => {
+      const ans = answers[i] || '（スキップ）';
+      return `【${q.tag}】\nQ: ${q.text}\nA: ${ans}`;
+    }).join('\n\n');
+
+    const prompt =
+`以下の対話内容をもとに、YOSUKEさんらしいnote記事（1500〜2500字）を書いてください。
+
+▼ YOSUKEさんのプロフィール
+医療系スタートアップ共同創業COO。元外資製薬マーケ→コンサル→外資製薬セールス。薬剤師。軽井沢に家族移住。サッカー・フットサル・ポーカー・サウナ・キャンプが趣味。
+
+▼ 文体の指示
+- 常体（だ・である）ベース。丁寧語（です・ます）は使わない
+- 感情を正直に書く（「歯がゆい気持ちがあった」「少し衝撃だった」「正直なところ」）
+- 自分に問いを投げかけながら思考を展開する
+- 個人の体験を社会・人生全体に広げる抽象化を入れる
+- 締めは行動宣言か余韻を残す形で
+- 箇条書きは使わない。本文はすべて流れる文章で
+- 小見出しは問いかけ型か断言型を適度に使う
+
+▼ 記事構成（目安）
+1. 導入（具体的な場面・エピソードで始める）150〜250字
+2. 感情・違和感の開示 200〜300字
+3. 問いの展開（なぜそう感じたかの分析）400〜600字
+4. 抽象化・普遍化 300〜400字
+5. 着地（行動宣言 or 読者へのメッセージ）200〜300字
+
+▼ 対話内容
+${qaPairs}
+
+▼ 出力形式
+まずタイトル案を3つ提示してください。
+　① 問いかけ型
+　② 断言型
+　③ 逆説型
+タイトルが決まったら（または「全部任せる」と言ってもらえたら）本文を生成してください。`;
+
+    document.getElementById('prompt-preview').textContent = prompt;
+    window._generatedPrompt = prompt;
+    showScreen('s-final');
+  }
+
+  // ─── COPY ─────────────────────────────────────────────────────────────────────
+  function copyPrompt() {
+    const text = window._generatedPrompt || '';
+    const toast = document.getElementById('copy-toast');
+
+    const show = () => {
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 4000);
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(show).catch(() => fallbackCopy(text, show));
+    } else {
+      fallbackCopy(text, show);
+    }
+  }
+
+  function fallbackCopy(text, cb) {
+    const el = document.createElement('textarea');
+    el.value = text;
+    el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+    document.body.appendChild(el);
+    el.focus(); el.select();
+    try { document.execCommand('copy'); cb && cb(); }
+    catch { alert('コピーできませんでした。テキストを長押しして手動でコピーしてください。'); }
+    document.body.removeChild(el);
+  }
+
+  // ─── SPEECH RECOGNITION ───────────────────────────────────────────────────────
+  function toggleRecording() {
+    isRecording ? stopRecording() : startRecording();
+  }
+
+  function startRecording() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      alert('このブラウザは音声認識に対応していません（Safari iOS 14.5以降が必要です）。テキストで入力してください。');
+      return;
+    }
+
+    recognition = new SR();
+    recognition.lang = 'ja-JP';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    const textarea = document.getElementById('answer-input');
+    let finalBase = textarea.value;
+
+    recognition.onresult = (e) => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) { finalBase += (finalBase && !finalBase.endsWith('。') && !finalBase.endsWith('、') ? '。' : '') + t; }
+        else { interim = t; }
+      }
+      textarea.value = finalBase + interim;
+      textarea.scrollTop = textarea.scrollHeight;
+    };
+
+    recognition.onerror = (e) => {
+      stopRecording();
+      if (e.error === 'not-allowed') {
+        alert('マイクへのアクセスが拒否されました。Safari の設定 → このサイト → マイク → 許可 にしてください。');
+      }
+    };
+
+    // iOS Safari: recognition stops after silence; restart automatically
+    recognition.onend = () => {
+      if (isRecording) {
+        try { recognition.start(); } catch (_) {}
+      }
+    };
+
+    try {
+      recognition.start();
+      isRecording = true;
+      document.getElementById('mic-btn').classList.add('recording');
+      document.getElementById('mic-btn').textContent = '⏹';
+      document.getElementById('mic-label').textContent = '録音中… タップで停止';
+      document.getElementById('mic-label').classList.add('recording');
+    } catch (err) {
+      alert('音声認識を開始できませんでした: ' + err.message);
+    }
+  }
+
+  function stopRecording() {
+    isRecording = false;
+    if (recognition) { try { recognition.stop(); } catch (_) {} recognition = null; }
+    const btn = document.getElementById('mic-btn');
+    const lbl = document.getElementById('mic-label');
+    if (btn) {
+      btn.classList.remove('recording');
+      btn.textContent = '🎙️';
+    }
+    if (lbl) {
+      lbl.textContent = 'タップして録音';
+      lbl.classList.remove('recording');
+    }
+  }
+</script>
+</body>
+</html>
