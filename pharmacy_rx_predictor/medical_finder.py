@@ -117,12 +117,14 @@ class MedFacility:
     outpatient_rx: str = "—"      # 院外処方の有無
     rx_summary: str = "不明"       # 総合: "院外処方あり" / "院内処方のみ" / "不明"
     daily_outpatients: Optional[int] = None
+    daily_outpatients_source: str = "—"   # 外来患者数の出典
     weekly_op_days: Optional[float] = None
     specialties: str = ""
     facility_category: str = "診療所"
     kikan_kbn_used: int = 2
     detail_fetched: bool = False
     detail_url: str = ""
+    distance_note: str = ""        # 距離の信頼度メモ（"確認済" / "要確認(Xm差)" 等）
     raw_fields: Dict[str, str] = field(default_factory=dict)   # デバッグ用
 
 
@@ -259,24 +261,20 @@ class GeocoderService:
         short = self._shorten(clean)
         has_short = short and short != clean
 
-        # ① GSI – 完全住所
         result = self._gsi(clean)
         if result:
             return result
 
-        # ② GSI – 短縮住所（建物名・フロア除去）
         if has_short:
             result = self._gsi(short)
             if result:
                 return result
 
-        # ③ Nominatim – 完全住所
         time.sleep(1.0)
         result = self._nominatim(clean)
         if result:
             return result
 
-        # ④ Nominatim – 短縮住所
         if has_short:
             time.sleep(0.5)
             result = self._nominatim(short)
@@ -284,6 +282,36 @@ class GeocoderService:
                 return result
 
         return None
+
+    def geocode_with_verification(
+        self, address: str
+    ) -> Tuple[Optional[Tuple[float, float]], str]:
+        """
+        GSI と Nominatim を両方試して結果を比較し、距離ノートを返す。
+        Returns: (coords, note)
+          note: "確認済(Xm差)" / "要確認(Xm差)" / "GSIのみ" / "Nominatimのみ" / "取得失敗"
+        """
+        clean = self._clean(address)
+        short = self._shorten(clean)
+        has_short = short and short != clean
+
+        gsi_result = self._gsi(clean) or (self._gsi(short) if has_short else None)
+        time.sleep(0.8)
+        nom_result = self._nominatim(clean) or (self._nominatim(short) if has_short else None)
+
+        if gsi_result and nom_result:
+            diff = haversine(gsi_result[0], gsi_result[1], nom_result[0], nom_result[1])
+            if diff <= 150:
+                return gsi_result, f"確認済({diff:.0f}m差)"
+            elif diff <= 400:
+                return gsi_result, f"中程度({diff:.0f}m差)"
+            else:
+                return gsi_result, f"要確認({diff:.0f}m差・目視推奨)"
+        elif gsi_result:
+            return gsi_result, "GSIのみ取得"
+        elif nom_result:
+            return nom_result, "Nominatimのみ取得"
+        return None, "取得失敗"
 
 
 _geocoder = GeocoderService()
@@ -616,9 +644,13 @@ class MHLWScraper:
             fac.facility_category = "病院"
 
         # ── 院内処方 / 院外処方 ──────────────────────────────────────────
-        # MHLW ページに「院内処方の有無」「院外処方の有無」フィールドが存在する
-        inhouse = _get_field(all_fields, ["院内処方の有無", "院内処方"])
-        outpatient = _get_field(all_fields, ["院外処方の有無", "院外処方"])
+        inhouse = _get_field(all_fields, [
+            "院内処方の有無", "院内処方", "調剤（院内処方）", "院内調剤",
+        ])
+        outpatient = _get_field(all_fields, [
+            "院外処方の有無", "院外処方", "調剤（院外処方）", "院外調剤",
+            "処方せんの交付", "処方箋の交付",
+        ])
         fac.inhouse_rx   = inhouse   or "—"
         fac.outpatient_rx = outpatient or "—"
 
@@ -632,8 +664,9 @@ class MHLWScraper:
             # フォールバック: フルテキスト検索
             fac.rx_summary = _infer_rx_type(full_text)
 
-        # ── 1日平均外来患者数 ─────────────────────────────────────────────
-        fac.daily_outpatients = _parse_daily_outpatients(all_fields, full_text, soup)
+        # ── 1日平均外来患者数（ナビィのみ） ──────────────────────────────────
+        fac.daily_outpatients, fac.daily_outpatients_source = \
+            _parse_daily_outpatients(all_fields, full_text, soup)
 
         # ── 週あたり診療日数 ──────────────────────────────────────────────
         fac.weekly_op_days = _parse_weekly_days(all_fields, full_text, soup)
@@ -669,10 +702,13 @@ def _infer_rx_type(full_text: str) -> str:
                 return "院外処方あり"
             if any(w in line for w in ["無し", "無", "なし", "不可"]):
                 return "院内処方のみ"
+        if "処方せん" in line or "処方箋" in line:
+            if any(w in line for w in ["交付", "発行", "有"]):
+                return "院外処方あり"
         if "院内処方" in line:
             if any(w in line for w in ["有り", "有", "あり"]):
                 return "院内処方のみ"
-    if "院外処方" in full_text:
+    if "院外処方" in full_text or "処方せんの交付" in full_text:
         return "院外処方あり（推定）"
     return "不明"
 
@@ -681,89 +717,89 @@ def _parse_daily_outpatients(
     fields: Dict[str, str],
     full_text: str,
     soup: Optional[BeautifulSoup] = None,
-) -> Optional[int]:
+) -> Tuple[Optional[int], str]:
     """
-    1日平均外来患者数を抽出。
+    1日平均外来患者数を抽出。ナビィデータのみを対象とする。
+    Returns: (value, source_description)
     優先順:
       1. 統計テーブル「前年度１日平均患者数」行の「外来患者」列（最も信頼性高）
-      2. フィールド名「1日あたりの外来患者の平均数」等（医療実績タブ）
-      3. フィールド名「1日平均外来患者数」等（基本情報タブ）
-      4. 年間値 → ÷305
-      5. フルテキスト正規表現
+      2. フィールド名「前年度１日平均患者数」等
+      3. フィールド名「1日あたりの外来患者の平均数」等
+      4. フルテキスト正規表現（ナビィページ内）
     """
     # ─ 優先①: 統計テーブルから直接取得（最も正確）────────────────────────
     if soup is not None:
         result = _parse_outpatients_from_stats_table(soup)
         if result is not None:
-            return result
+            return result, "ナビィ（実績統計表）"
 
-    # ─ 優先②: all_fields["前年度１日平均患者数"] から外来患者列を特定 ──────
-    # get_facility_detail() の tr パース結果にこのキーが入る:
-    #   "前年度１日平均患者数" → "- / - / - / - / - / - / 60.4人 / 0人"
-    # 外来患者は常に在宅患者(最後)の1つ前 → 「X人」パターンの末尾-2番目
+    # ─ 優先②: all_fields["前年度１日平均患者数"] ────────────────────────────
     v_zennen = fields.get("前年度１日平均患者数", "")
     if v_zennen:
-        # 「X人」または「X.X人」パターンを全て抽出
         patient_vals = re.findall(r"(\d+\.?\d*)人", v_zennen)
         if len(patient_vals) >= 2:
-            # 外来患者 = 在宅患者の1つ前（末尾から2番目）
             n = float(patient_vals[-2])
             if 0 < n <= 10_000:
-                return int(round(n))
+                return int(round(n)), "ナビィ（前年度フィールド）"
         elif len(patient_vals) == 1:
             n = float(patient_vals[0])
             if 0 < n <= 10_000:
-                return int(round(n))
+                return int(round(n)), "ナビィ（前年度フィールド）"
 
-    # ─ 優先③〜: フィールド・テキストベース処理 ──────────────────────────
-    # 検索キー（広めに設定 — MHLW フィールド名にはツールチップが付加されている）
-    # 例: "紹介を受けた外来患者数（月平均）外来患者数前年度の１日平均外来患者数..."
+    # ─ 優先③: フィールド名マッチ ─────────────────────────────────────────
     candidate_keys = [
         "1日あたりの外来患者の平均数",
         "外来患者の平均数",
         "1日平均外来患者数",
         "一日平均外来患者数",
         "外来患者数（1日平均）",
-        "紹介を受けた外来患者数",   # MHLW 実際のフィールド名
+        "前年度の１日平均外来患者数",
+        "前年度１日平均外来患者数",
+        "１日平均外来患者数",
         "1日あたり外来患者数",
         "外来（1日平均）",
         "外来患者の延数",
-        "外来患者数",               # 広いマッチ（最後に）
+        "外来患者数",
     ]
     for k_target in candidate_keys:
         v = _get_field(fields, [k_target])
         if v:
-            nums = re.findall(r"[\d,]+", v)
+            m_person = re.search(r"(\d+\.?\d*)\s*人", v)
+            if m_person:
+                n = float(m_person.group(1))
+                if 0 < n <= 10_000:
+                    return int(round(n)), f"ナビィ（{k_target}）"
+            nums = re.findall(r"[\d,]+\.?\d*", v)
             for n_str in nums:
                 try:
-                    n = int(n_str.replace(",", ""))
+                    n = float(n_str.replace(",", ""))
                     if 1 <= n <= 3_000:
-                        return n
-                    if n > 3_000:  # 年間値
-                        return max(1, int(n / WORKING_DAYS))
+                        return int(round(n)), f"ナビィ（{k_target}）"
+                    if n > 3_000:
+                        return max(1, int(n / WORKING_DAYS)), f"ナビィ（{k_target}・年間÷305）"
                 except ValueError:
                     pass
 
-    # フルテキスト正規表現（医療実績タブの見出し近くを優先）
-    for pat in [
-        r"1日あたりの外来患者の平均数[^\d]{0,20}(\d{1,4})",
-        r"外来患者の平均数[^\d]{0,15}(\d{1,4})",
-        r"1日平均外来患者数[^\d]{0,15}(\d{1,4})",
-        r"一日平均外来患者数[^\d]{0,15}(\d{1,4})",
-        r"外来患者[^\d]{0,10}1日平均[^\d]{0,10}(\d{1,4})",
-        r"外来[^\d]{0,8}(\d{1,3})人[/／]日",
-        r"(\d{1,3})人[/／]日[^\d]{0,10}外来",
+    # ─ 優先④: フルテキスト正規表現（ナビィページ内テキスト）──────────────
+    for pat, label in [
+        (r"1日あたりの外来患者の平均数[^\d]{0,20}(\d{1,4})", "ナビィ（テキスト解析）"),
+        (r"前年度の?１?日平均外来患者数[^\d]{0,15}(\d{1,4})", "ナビィ（テキスト解析）"),
+        (r"外来患者の平均数[^\d]{0,15}(\d{1,4})", "ナビィ（テキスト解析）"),
+        (r"1日平均外来患者数[^\d]{0,15}(\d{1,4})", "ナビィ（テキスト解析）"),
+        (r"外来患者[^\d]{0,10}1日平均[^\d]{0,10}(\d{1,4})", "ナビィ（テキスト解析）"),
+        (r"外来[^\d]{0,8}(\d{1,3})\s*人[/／]日", "ナビィ（テキスト解析）"),
+        (r"前年度[^\d]{0,20}外来[^\d]{0,10}(\d{1,4}\.?\d*)\s*人", "ナビィ（テキスト解析）"),
     ]:
         m = re.search(pat, full_text)
         if m:
             try:
-                n = int(m.group(1).replace(",", ""))
+                n = float(m.group(1).replace(",", ""))
                 if 1 <= n <= 3_000:
-                    return n
+                    return int(round(n)), label
             except ValueError:
                 pass
 
-    return None
+    return None, "—"
 
 
 def _parse_weekly_days(
@@ -890,45 +926,78 @@ def _count_open_days_from_hours_table(soup: BeautifulSoup) -> Optional[int]:
 def _extract_outpatient_from_table(table) -> Optional[int]:
     """
     テーブルから外来患者数を抽出するヘルパー。
-    「外来患者」列ヘッダを先頭一致で特定し、「前年度」行の値を返す。
-    列ヘッダの先頭が「外来患者」で始まるかで判定することで、
-    ツールチップ文字列に「紹介」が含まれる場合の誤除外を防ぐ。
+    病院形式（多列ヘッダ）と診療所形式（2列）の両方に対応。
     """
     rows = table.find_all("tr")
-    if len(rows) < 2:
+    if not rows:
         return None
 
-    # ヘッダ行から「外来患者」列インデックスを特定
-    # 「外来患者」で始まる列（「紹介を受けた外来患者数（月平均）」は「紹介」で始まるので除外される）
     header_cells = rows[0].find_all(["th", "td"])
     header_texts = [re.sub(r"\s+", "", c.get_text(strip=True)) for c in header_cells]
 
+    # ─ 形式A: 病院形式（ヘッダ行に「外来患者」列がある） ──────────────────
     gairaikan_col: Optional[int] = None
     for i, h in enumerate(header_texts):
         if h.startswith("外来患者") and "月平均" not in h:
             gairaikan_col = i
             break
-    if gairaikan_col is None:
-        return None
 
-    # 「前年度」を含む行（前年度１日平均患者数）を探す
-    for row in rows[1:]:
+    if gairaikan_col is not None and len(rows) >= 2:
+        for row in rows[1:]:
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            row_label = cells[0].get_text(strip=True)
+            if "前年度" not in row_label:
+                continue
+            if gairaikan_col >= len(cells):
+                continue
+            val = cells[gairaikan_col].get_text(strip=True)
+            if not val or re.fullmatch(r"[－\-−—―\s]*", val):
+                continue
+            m = re.search(r"(\d+\.?\d*)", val)
+            if m:
+                n = float(m.group(1))
+                if 0 < n <= 10_000:
+                    return int(round(n))
+
+    # ─ 形式B: 診療所形式（行ラベルに「外来」を含む2列テーブル） ──────────
+    outpatient_row_kw = ["外来患者", "外来数", "１日平均", "1日平均", "日平均外来"]
+    for row in rows:
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        label = re.sub(r"\s+", "", cells[0].get_text(strip=True))
+        if not any(kw in label for kw in outpatient_row_kw):
+            continue
+        if any(ex in label for ex in ["紹介", "入院", "在宅"]):
+            continue
+        for cell in cells[1:]:
+            val = cell.get_text(strip=True)
+            m = re.search(r"(\d+\.?\d*)", val)
+            if m:
+                n = float(m.group(1))
+                if 0 < n <= 10_000:
+                    return int(round(n))
+
+    # ─ 形式C: 「前年度」行に数値が1つだけある（シンプルな診療所フォーマット）
+    for row in rows:
         cells = row.find_all(["th", "td"])
         if not cells:
             continue
-        row_label = cells[0].get_text(strip=True)
-        if "前年度" not in row_label:
+        label = cells[0].get_text(strip=True)
+        if "前年度" not in label:
             continue
-        if gairaikan_col >= len(cells):
-            continue
-        val = cells[gairaikan_col].get_text(strip=True)
-        if not val or re.fullmatch(r"[－\-−—―\s]*", val):
-            continue
-        m = re.search(r"(\d+\.?\d*)", val)
-        if m:
-            n = float(m.group(1))
-            if 0 < n <= 10_000:
-                return int(round(n))
+        for cell in cells[1:]:
+            val = cell.get_text(strip=True)
+            if re.fullmatch(r"[－\-−—―\s]*", val):
+                continue
+            m = re.search(r"(\d+\.?\d*)", val)
+            if m:
+                n = float(m.group(1))
+                if 0 < n <= 5_000:
+                    return int(round(n))
+
     return None
 
 
@@ -988,6 +1057,17 @@ def _parse_specialties(fields: Dict[str, str], full_text: str) -> str:
     return ""
 
 
+# ─── ゾーン判定 ───────────────────────────────────────────────────────────────
+def get_zone_label(distance_m: Optional[float], zones: List[int]) -> str:
+    """距離からゾーンラベルを返す。zones は昇順の4要素リスト [z1, z2, z3, z4]"""
+    if distance_m is None:
+        return "不明"
+    for z in zones:
+        if distance_m <= z:
+            return f"〜{z}m"
+    return f"{zones[-1]}m超"
+
+
 # ─── セッション状態 ────────────────────────────────────────────────────────────
 _defaults = {
     "results": [],
@@ -995,7 +1075,7 @@ _defaults = {
     "center_lon": None,
     "search_log": [],
     "last_address": "",
-    "last_radius_km": 2,
+    "last_zones": [50, 500, 1000, 2000, 5000],
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -1003,9 +1083,10 @@ for k, v in _defaults.items():
 
 
 # ─── UI ────────────────────────────────────────────────────────────────────────
-st.title("🏥 医療機関検索ツール v3.0")
+st.title("🏥 医療機関検索ツール v3.2")
 st.caption(
-    "住所と検索半径を入力 → 圏内の医療機関の **院内/院外処方・外来患者数・週診療日数・診療科** を一覧表示。  \n"
+    "住所とゾーン境界を入力 → 圏内の医療機関の **院内/院外処方・外来患者数・週診療日数・診療科** をゾーン別に表示。  \n"
+    "ナビイ再検索 + OSM再検索の **二重確認**で漏れを防止します。  \n"
     "データソース: **厚生労働省ナビイ** + **OpenStreetMap**"
 )
 
@@ -1018,12 +1099,39 @@ with st.sidebar:
         placeholder="例: 東京都新宿区高田馬場3丁目",
         help="都道府県から入力してください。丁目・番地まで入力するとより正確です。",
     )
-    radius_km = st.slider(
-        "📏 検索半径",
-        min_value=1, max_value=10, value=2, step=1,
-        format="%d km",
+
+    st.subheader("📏 ゾーン境界設定")
+    num_zones = st.radio(
+        "ゾーン数", [3, 4, 5], index=1, horizontal=True,
+        help="使用するゾーンの数を選択。不要なゾーンは非表示になります。",
     )
-    st.caption(f"検索半径: **{radius_km} km**（{radius_km * 1000:,} m）")
+
+    _zone_defaults = [50, 500, 1000, 2000, 5000]
+    _zone_labels   = ["ゾーン1", "ゾーン2", "ゾーン3", "ゾーン4", "ゾーン5"]
+    _zone_steps    = [10, 50, 100, 100, 500]
+    _zone_maxvals  = [5000, 5000, 10000, 10000, 10000]
+
+    raw_zone_vals = []
+    cols_row1 = st.columns(min(num_zones, 3))
+    cols_row2 = st.columns(num_zones - 3) if num_zones > 3 else []
+    all_cols = list(cols_row1) + list(cols_row2)
+
+    for i in range(num_zones):
+        v = all_cols[i].number_input(
+            f"{_zone_labels[i]} (m)",
+            min_value=10, max_value=_zone_maxvals[i],
+            value=_zone_defaults[i], step=_zone_steps[i],
+        )
+        raw_zone_vals.append(int(v))
+
+    zones = sorted(raw_zone_vals)
+    radius_m_max = zones[-1]
+
+    _zone_colors_icon = ["🔵", "🟢", "🟡", "🔴", "🟣"]
+    zone_summary = " ／ ".join(
+        f"{_zone_colors_icon[i]} Z{i+1}: 〜**{z:,}m**" for i, z in enumerate(zones)
+    )
+    st.caption(zone_summary)
 
     pref_sel = st.selectbox(
         "🗾 都道府県（任意・検索精度向上）",
@@ -1044,6 +1152,12 @@ with st.sidebar:
         help="OpenStreetMap Overpass API で半径圏内の施設を追加取得。\n"
              "MHLWにない施設も含めて網羅的に検索できます。",
     )
+    verify_distance = st.checkbox(
+        "🔍 距離二重確認モード",
+        value=True,
+        help="GSI と Nominatim の両方でジオコーディングし、結果が大きく異なる施設を"
+             "「要確認」フラグで表示します。精度向上しますが検索時間が増加します。",
+    )
     show_debug = st.checkbox("🔧 全取得フィールドを表示（デバッグ）", value=False)
 
     st.divider()
@@ -1060,7 +1174,7 @@ if run_btn and address_input.strip():
     results: List[MedFacility] = []
     scraper = MHLWScraper()
     pref_code = PREFECTURE_CODES.get(pref_sel, "")
-    radius_m = radius_km * 1000
+    radius_m = radius_m_max
 
     prog = st.progress(0, text="[1/5] 住所のジオコーディング中…")
 
@@ -1073,11 +1187,13 @@ if run_btn and address_input.strip():
     log.append(f"✅ ジオコーディング: lat={center_lat:.5f}, lon={center_lon:.5f}")
     prog.progress(8, text="[2/5] OSM で圏内施設を取得中…")
 
-    # Step2: OSM Overpass（高速・座標付き）
+    # Step2: OSM Overpass（高速・座標付き — OSM座標は地図由来で高精度）
     osm_results: List[MedFacility] = []
     if use_osm:
         osm_results = search_osm_medical(center_lat, center_lon, radius_m)
-        log.append(f"🗺️ OSM取得: {len(osm_results)}件（半径{radius_km}km圏内）")
+        for osm_f in osm_results:
+            osm_f.distance_note = "OSM座標（高精度）"
+        log.append(f"🗺️ OSM取得: {len(osm_results)}件（半径{radius_m}m圏内）")
     prog.progress(20, text=f"[3/5] MHLW からエリア内医療機関を検索中（緯度/経度ベース）…")
 
     area_kw = extract_area_keyword(address_input.strip())
@@ -1131,7 +1247,12 @@ if run_btn and address_input.strip():
                 mhlw_in_radius.append(fac)
             continue
 
-        gc = _geocoder.geocode(fac.address)
+        if verify_distance:
+            gc, dist_note = _geocoder.geocode_with_verification(fac.address)
+            fac.distance_note = dist_note
+        else:
+            gc = _geocoder.geocode(fac.address)
+            fac.distance_note = ""
         if gc:
             fac.lat, fac.lon = gc
             fac.distance_m = haversine(center_lat, center_lon, fac.lat, fac.lon)
@@ -1140,8 +1261,8 @@ if run_btn and address_input.strip():
         else:
             geocode_failed += 1
             if is_1km:
-                # 1km圏内確定 → ジオコーディング失敗でも追加（座標・距離は不明）
                 fac.distance_m = None
+                fac.distance_note = "座標取得失敗"
                 mhlw_in_radius.append(fac)
         time.sleep(0.10)
 
@@ -1191,6 +1312,99 @@ if run_btn and address_input.strip():
         time.sleep(0.6)
 
     log.append(f"✅ 完了: 詳細取得済 {sum(1 for f in targets if f.detail_fetched)}件")
+
+    # ── Step7: 推敲① — ナビイ再検索で漏れ確認 ───────────────────────────────
+    prog.progress(96, text="[5/7] 推敲①: ナビイ再検索で漏れ確認中…")
+    existing_kikan_cds = {f.kikan_cd for f in merged if f.kikan_cd}
+    existing_names     = [f.name for f in merged]
+
+    verify_mhlw, msg_v1 = scraper.search_medical_by_latlon(
+        center_lat, center_lon,
+        radius_m=radius_m,
+        center_name=area_kw,
+        max_pages=12,
+    )
+    added_from_mhlw = 0
+    for vf in verify_mhlw:
+        # kikanCd で重複チェック
+        if vf.kikan_cd and vf.kikan_cd in existing_kikan_cds:
+            continue
+        # 名前類似度で重複チェック
+        if any(name_similarity(vf.name, en) >= 0.70 for en in existing_names):
+            continue
+        # 距離確認
+        if not vf.address:
+            continue
+        gc = _geocoder.geocode(vf.address)
+        if gc:
+            vf.lat, vf.lon = gc
+            vf.distance_m = haversine(center_lat, center_lon, vf.lat, vf.lon)
+            if vf.distance_m <= radius_m:
+                vf.source = "mhlw(再確認追加)"
+                merged.append(vf)
+                existing_names.append(vf.name)
+                if vf.kikan_cd:
+                    existing_kikan_cds.add(vf.kikan_cd)
+                added_from_mhlw += 1
+        time.sleep(0.10)
+
+    # Step7で追加されたMHLW施設の詳細をここで取得
+    new_mhlw_facs = [f for f in merged
+                     if f.source == "mhlw(再確認追加)" and not f.detail_fetched
+                     and f.pref_cd and f.kikan_cd]
+    for i, fac in enumerate(new_mhlw_facs):
+        prog.progress(97, text=f"[5/7] 推敲①: 追加施設の詳細取得中 ({i+1}/{len(new_mhlw_facs)}): {fac.name[:20]}…")
+        ok = scraper.get_facility_detail(fac)
+        log.append(f"  {'✅' if ok else '⏸'} [推敲①追加] {fac.name[:25]} "
+                   f"rx={fac.rx_summary} op={fac.daily_outpatients}")
+        time.sleep(0.6)
+
+    log.append(f"🔍 推敲①ナビイ再検索: {len(verify_mhlw)}件確認 → 追加 {added_from_mhlw}件")
+
+    # ── Step8: 推敲② — OSM 再検索で漏れ確認 ────────────────────────────────
+    prog.progress(98, text="[7/7] 推敲②: OSM 再検索で漏れ確認中…")
+    verify_osm = search_osm_medical(center_lat, center_lon, radius_m)
+    added_from_osm = 0
+    new_osm_facs = []
+    for vf in verify_osm:
+        if any(name_similarity(vf.name, en) >= 0.70 for en in existing_names):
+            continue
+        vf.source = "osm(再確認追加)"
+        merged.append(vf)
+        new_osm_facs.append(vf)
+        existing_names.append(vf.name)
+        added_from_osm += 1
+
+    # Step8で追加されたOSM施設もナビィで詳細取得を試みる（名前でkikanCd探索）
+    for i, fac in enumerate(new_osm_facs):
+        if not fac.lat or not fac.lon:
+            continue
+        prog.progress(99, text=f"[7/7] 推敲②: 追加施設のナビィ照合中 ({i+1}/{len(new_osm_facs)}): {fac.name[:20]}…")
+        # 座標周辺100mでナビィ再検索して名前一致するものの詳細を取得
+        nearby, _ = scraper.search_medical_by_latlon(fac.lat, fac.lon, radius_m=200, max_pages=2)
+        for nf in nearby:
+            if name_similarity(fac.name, nf.name) >= 0.65:
+                fac.pref_cd = nf.pref_cd
+                fac.kikan_cd = nf.kikan_cd
+                fac.kikan_kbn_used = nf.kikan_kbn_used
+                fac.href = nf.href
+                fac.source = "osm+mhlw(再確認追加)"
+                ok = scraper.get_facility_detail(fac)
+                log.append(f"  {'✅' if ok else '⏸'} [推敲②追加] {fac.name[:25]} "
+                           f"rx={fac.rx_summary} op={fac.daily_outpatients}")
+                break
+        time.sleep(0.5)
+
+    log.append(f"🔍 推敲②OSM再検索: {len(verify_osm)}件確認 → 追加 {added_from_osm}件")
+
+    merged.sort(key=lambda x: x.distance_m or 9_999_999)
+
+    total_added = added_from_mhlw + added_from_osm
+    if total_added > 0:
+        log.append(f"⚠️ 二重確認で合計 {total_added}件 を追加しました（推敲①:{added_from_mhlw}件 推敲②:{added_from_osm}件）")
+    else:
+        log.append("✅ 二重確認: 追加漏れなし（ナビイ・OSM ともに差分ゼロ）")
+
     results = merged
 
     st.session_state.results = results
@@ -1198,7 +1412,7 @@ if run_btn and address_input.strip():
     st.session_state.center_lon = center_lon
     st.session_state.search_log = log
     st.session_state.last_address = address_input.strip()
-    st.session_state.last_radius_km = radius_km
+    st.session_state.last_zones = zones
     prog.progress(100, text="✅ 完了!")
     time.sleep(0.3)
     prog.empty()
@@ -1209,25 +1423,49 @@ if st.session_state.results:
     results: List[MedFacility] = st.session_state.results
     center_lat = st.session_state.center_lat
     center_lon = st.session_state.center_lon
-    radius_km  = st.session_state.last_radius_km
+    zones_saved = st.session_state.last_zones   # 可変長リスト（3〜5要素）
 
+    _ZONE_ICONS = ["🔵", "🟢", "🟡", "🔴", "🟣"]
+    zone_labels  = [f"〜{z:,}m" for z in zones_saved]
+    zone_colors  = _ZONE_ICONS[:len(zones_saved)]
+    zone_summary_str = " ／ ".join(
+        f"{c}〜{z:,}m" for c, z in zip(zone_colors, zones_saved)
+    )
     st.success(
-        f"**{st.session_state.last_address}** 周辺 **{radius_km} km** 圏内: "
+        f"**{st.session_state.last_address}** 周辺 {zone_summary_str} 圏内: "
         f"**{len(results)} 件** が見つかりました"
     )
+
+    # ── ゾーン別サマリーカード ─────────────────────────────────────────
+    z_cols = st.columns(len(zones_saved))
+    for i, (label, color, col) in enumerate(zip(zone_labels, zone_colors, z_cols)):
+        z_facs = [f for f in results
+                  if get_zone_label(f.distance_m, zones_saved) == label]
+        op_vals = [f.daily_outpatients for f in z_facs if f.daily_outpatients]
+        col.metric(
+            f"{color} {label}",
+            f"{len(z_facs)}件",
+            delta=f"外来合計 {sum(op_vals):,}人/日" if op_vals else "外来データなし",
+            delta_color="off",
+        )
 
     tab_table, tab_map, tab_debug, tab_log = st.tabs(
         ["📋 一覧表", "🗺️ 地図", "🔬 デバッグ", "📝 ログ"])
 
     # ── 一覧表 ────────────────────────────────────────────────────────────
     with tab_table:
-        col_f1, col_f2, col_f3 = st.columns(3)
-        rx_filter  = col_f1.selectbox("処方タイプ", ["すべて", "院外処方あり", "院内処方のみ", "不明"])
-        cat_filter = col_f2.selectbox("施設種別", ["すべて", "診療所", "病院", "歯科診療所"])
-        sort_col   = col_f3.selectbox("並び順",
-                                       ["距離（近い順）", "施設名", "外来患者数（多い順）"])
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        zone_options = ["すべて"] + zone_labels + [f"{zones_saved[-1]:,}m超"]
+        zone_filter = col_f1.selectbox("🔵 ゾーン", zone_options)
+        rx_filter   = col_f2.selectbox("処方タイプ", ["すべて", "院外処方あり", "院内処方のみ", "不明"])
+        cat_filter  = col_f3.selectbox("施設種別", ["すべて", "診療所", "病院", "歯科診療所"])
+        sort_col    = col_f4.selectbox("並び順",
+                                        ["距離（近い順）", "施設名", "外来患者数（多い順）"])
 
         filtered = list(results)
+        if zone_filter != "すべて":
+            filtered = [f for f in filtered
+                        if get_zone_label(f.distance_m, zones_saved) == zone_filter]
         if rx_filter != "すべて":
             filtered = [f for f in filtered if f.rx_summary == rx_filter]
         if cat_filter != "すべて":
@@ -1240,38 +1478,53 @@ if st.session_state.results:
             filtered.sort(key=lambda x: x.distance_m or 9_999_999)
 
         # 表示用データ構築
+        needs_check_count = 0
         rows = []
         for fac in filtered:
+            needs_check = "要確認" in fac.distance_note
+            if needs_check:
+                needs_check_count += 1
             rows.append({
-                "施設名":       fac.name,
-                "距離(m)":      int(fac.distance_m) if fac.distance_m else None,
-                "種別":         fac.facility_category,
-                "診療科":       fac.specialties or "—",
-                "院外処方":     fac.rx_summary,
-                "院内処方(有無)": fac.inhouse_rx,
-                "院外処方(有無)": fac.outpatient_rx,
+                "ゾーン":        get_zone_label(fac.distance_m, zones_saved),
+                "施設名":        fac.name,
+                "距離(m)":       int(fac.distance_m) if fac.distance_m else None,
+                "距離確度":      fac.distance_note or "—",
+                "種別":          fac.facility_category,
+                "診療科":        fac.specialties or "—",
+                "院外処方":      fac.rx_summary,
+                "院内処方(有無)":fac.inhouse_rx,
+                "院外処方(有無)":fac.outpatient_rx,
                 "1日外来患者数": fac.daily_outpatients,
-                "週診療日数":   fac.weekly_op_days,
-                "ソース":       fac.source,
-                "住所":         fac.address,
+                "外来出典":      fac.daily_outpatients_source,
+                "週診療日数":    fac.weekly_op_days,
+                "住所":          fac.address,
             })
         df = pd.DataFrame(rows)
+
+        if needs_check_count > 0:
+            st.warning(
+                f"⚠️ **距離「要確認」: {needs_check_count}件** があります。"
+                "「距離確度」列に詳細を表示しています。目視で確認してください。"
+            )
+
         st.caption(f"表示: {len(rows)}件 / 全{len(results)}件")
         st.dataframe(
             df,
             use_container_width=True,
             height=520,
             column_config={
+                "ゾーン":         st.column_config.TextColumn("ゾーン", width="small"),
                 "施設名":         st.column_config.TextColumn("施設名", width="medium"),
                 "距離(m)":        st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
+                "距離確度":       st.column_config.TextColumn("距離確度", width="medium"),
                 "種別":           st.column_config.TextColumn("種別", width="small"),
                 "診療科":         st.column_config.TextColumn("診療科", width="medium"),
                 "院外処方":       st.column_config.TextColumn("処方タイプ", width="medium"),
                 "院内処方(有無)": st.column_config.TextColumn("院内処方", width="small"),
                 "院外処方(有無)": st.column_config.TextColumn("院外処方", width="small"),
                 "1日外来患者数":  st.column_config.NumberColumn("1日外来", format="%d 人/日", width="small"),
+                "外来出典":       st.column_config.TextColumn("外来出典", width="medium"),
                 "週診療日数":     st.column_config.NumberColumn("週診療日", format="%.1f 日", width="small"),
-                "ソース":         st.column_config.TextColumn("ソース", width="small"),
                 "住所":           st.column_config.TextColumn("住所", width="large"),
             },
         )
@@ -1294,17 +1547,21 @@ if st.session_state.results:
         # CSV ダウンロード
         st.divider()
         area_kw = extract_area_keyword(st.session_state.last_address)
+        zone_tag = "_".join(str(z) for z in zones_saved) + "m"
         csv_rows = [
             {
+                "ゾーン":           get_zone_label(f.distance_m, zones_saved),
                 "施設名":           f.name,
                 "住所":             f.address,
                 "距離_m":           int(f.distance_m) if f.distance_m else "",
+                "距離確度":         f.distance_note or "—",
                 "施設種別":         f.facility_category,
                 "診療科":           f.specialties,
                 "処方タイプ":       f.rx_summary,
                 "院内処方の有無":   f.inhouse_rx,
                 "院外処方の有無":   f.outpatient_rx,
                 "1日外来患者数":    f.daily_outpatients or "",
+                "外来患者数出典":   f.daily_outpatients_source,
                 "週平均診療日数":   f.weekly_op_days or "",
                 "データソース":     f.source,
                 "MHLW_URL":         f.detail_url,
@@ -1314,29 +1571,38 @@ if st.session_state.results:
         st.download_button(
             "⬇️ CSV ダウンロード",
             data=pd.DataFrame(csv_rows).to_csv(index=False, encoding="utf-8-sig"),
-            file_name=f"medical_{area_kw}_{radius_km}km.csv",
+            file_name=f"medical_{area_kw}_{zone_tag}.csv",
             mime="text/csv",
         )
 
     # ── 地図 ──────────────────────────────────────────────────────────────
     with tab_map:
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
         folium.Marker(
             [center_lat, center_lon],
             popup=st.session_state.last_address,
-            tooltip="📍 検索中心",
+            tooltip="📍 薬局候補地",
             icon=folium.Icon(color="red", icon="home", prefix="fa"),
         ).add_to(m)
-        folium.Circle(
-            [center_lat, center_lon],
-            radius=radius_km * 1000,
-            color="#2563EB", fill=True, fill_opacity=0.06,
-            tooltip=f"半径 {radius_km} km",
-        ).add_to(m)
+        # ゾーン数可変の同心円（外→内の順で描画）
+        _circle_colors  = ["#EF4444", "#A855F7", "#EAB308", "#22C55E", "#3B82F6"]
+        _circle_opacity = [0.03, 0.04, 0.05, 0.07, 0.10]
+        for i, z in enumerate(reversed(zones_saved)):
+            idx = len(zones_saved) - 1 - i
+            folium.Circle(
+                [center_lat, center_lon],
+                radius=z,
+                color=_circle_colors[idx],
+                fill=True,
+                fill_opacity=_circle_opacity[idx],
+                weight=2,
+                tooltip=f"ゾーン{idx+1} 〜{z:,}m",
+            ).add_to(m)
 
         for fac in results:
             if fac.lat is None or fac.lon is None:
                 continue
+            zone_lbl = get_zone_label(fac.distance_m, zones_saved)
             color = (
                 "green"  if fac.rx_summary == "院外処方あり"
                 else "orange" if fac.rx_summary == "院内処方のみ"
@@ -1349,7 +1615,7 @@ if st.session_state.results:
   <b>{fac.name}</b><br>
   <span style="color:#64748b;font-size:11px">{fac.address or '—'}</span><br>
   <hr style="margin:4px 0">
-  📏 <b>{fac.distance_m:,.0f} m</b> &nbsp; 🏷 {fac.facility_category}<br>
+  📏 <b>{fac.distance_m:,.0f} m</b> ／ {zone_lbl} &nbsp; 🏷 {fac.facility_category}<br>
   💊 <b>{fac.rx_summary}</b><br>
   &nbsp;&nbsp; 院内処方: {fac.inhouse_rx} / 院外処方: {fac.outpatient_rx}<br>
   👥 外来患者: <b>{fac.daily_outpatients or '—'}</b> 人/日<br>
@@ -1360,12 +1626,18 @@ if st.session_state.results:
             folium.Marker(
                 [fac.lat, fac.lon],
                 popup=folium.Popup(popup_html, max_width=280),
-                tooltip=f"🏥 {fac.name}（{fac.distance_m:,.0f}m）",
+                tooltip=f"🏥 {fac.name}（{fac.distance_m:,.0f}m / {zone_lbl}）",
                 icon=folium.Icon(color=color, icon=icon_name, prefix="fa"),
             ).add_to(m)
 
-        st_folium(m, use_container_width=True, height=560)
-        st.markdown("🟢 院外処方あり　🟠 院内処方のみ　🟣 病院　⚫ 不明　🔴 検索中心")
+        st_folium(m, width="stretch", height=560)
+        circle_legend = "　".join(
+            f"{_ZONE_ICONS[i]} Z{i+1}円" for i in range(len(zones_saved))
+        )
+        st.markdown(
+            f"🟢 院外処方あり　🟠 院内処方のみ　🟣 病院　⚫ 不明　🔴 薬局候補地  \n"
+            f"{circle_legend}"
+        )
 
     # ── デバッグ: 全フィールド ───────────────────────────────────────────
     with tab_debug:
