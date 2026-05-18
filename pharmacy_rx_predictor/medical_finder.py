@@ -148,6 +148,11 @@ class MedFacility:
     detail_fetched: bool = False
     detail_url: str = ""
     distance_note: str = ""        # 距離の信頼度メモ（"確認済" / "要確認(Xm差)" 等）
+    # 門前薬局情報（この医療機関の門前に薬局があるか）
+    monzen_pharmacy_name: str = "なし"
+    monzen_pharmacy_dist_m: Optional[float] = None
+    monzen_rx_count: Optional[int] = None      # 年間総取扱処方箋数
+    monzen_rx_source: str = "—"
     raw_fields: Dict[str, str] = field(default_factory=dict)   # デバッグ用
 
 
@@ -473,33 +478,51 @@ out center;
     return pharmacies
 
 
-def determine_pharmacy_types(
-    pharmacies: List[PharmacyFacility],
+def assign_monzen_to_clinics(
     med_facilities: List[MedFacility],
+    pharmacies: List[PharmacyFacility],
     threshold_m: float = 50.0,
 ) -> None:
-    """各薬局について最近接の医療機関を特定し、門前/面を判定する（in-place）。"""
-    for ph in pharmacies:
-        if ph.lat is None or ph.lon is None:
-            ph.pharmacy_type = "不明（座標なし）"
+    """
+    各医療機関の門前50m以内に薬局があるか判定し、MedFacilityに書き込む（in-place）。
+    同時に、薬局側にも最近接医療機関を記録する。
+    """
+    for mf in med_facilities:
+        if mf.lat is None or mf.lon is None:
+            mf.monzen_pharmacy_name = "不明（座標なし）"
             continue
         best_dist = float("inf")
-        best_name = "—"
-        for mf in med_facilities:
-            if mf.lat is None or mf.lon is None:
+        best_ph: Optional[PharmacyFacility] = None
+        for ph in pharmacies:
+            if ph.lat is None or ph.lon is None:
                 continue
-            d = haversine(ph.lat, ph.lon, mf.lat, mf.lon)
+            d = haversine(mf.lat, mf.lon, ph.lat, ph.lon)
             if d < best_dist:
                 best_dist = d
-                best_name = mf.name
-        ph.nearest_clinic_dist_m = best_dist if best_dist < float("inf") else None
-        ph.nearest_clinic_name = best_name
-        if best_dist <= threshold_m:
+                best_ph = ph
+        # 薬局側にも最近接医療機関を記録
+        if best_ph is not None:
+            if best_ph.nearest_clinic_dist_m is None or best_dist < best_ph.nearest_clinic_dist_m:
+                best_ph.nearest_clinic_name = mf.name
+                best_ph.nearest_clinic_dist_m = best_dist
+        # 医療機関側に門前情報を書き込む
+        if best_ph is not None and best_dist <= threshold_m:
+            mf.monzen_pharmacy_name = best_ph.name
+            mf.monzen_pharmacy_dist_m = best_dist
+            mf.monzen_rx_count = best_ph.annual_rx_count
+            mf.monzen_rx_source = best_ph.annual_rx_source
+        else:
+            mf.monzen_pharmacy_name = "なし"
+            mf.monzen_pharmacy_dist_m = None
+
+    # 薬局側の門前/面ラベルも付与（薬局タブ用）
+    for ph in pharmacies:
+        if ph.nearest_clinic_dist_m is not None and ph.nearest_clinic_dist_m <= threshold_m:
             ph.pharmacy_type = "門前薬局"
-        elif best_dist < float("inf"):
+        elif ph.nearest_clinic_dist_m is not None:
             ph.pharmacy_type = "面薬局"
         else:
-            ph.pharmacy_type = "不明（医療機関なし）"
+            ph.pharmacy_type = "不明"
 
 
 # ─── MHLWスクレイパー ──────────────────────────────────────────────────────────
@@ -1742,9 +1765,8 @@ if run_btn and address_input.strip():
                      if p.distance_m is not None and p.distance_m <= radius_m]
         ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
 
-        # 門前/面判定
-        coords_mf = [mf for mf in results if mf.lat and mf.lon]
-        determine_pharmacy_types(ph_merged, coords_mf, threshold_m=float(pharmacy_gate_m))
+        # 医療機関視点の門前判定（各クリニックに薬局情報を付与）
+        assign_monzen_to_clinics(results, ph_merged, threshold_m=float(pharmacy_gate_m))
         log.append(f"💊 薬局確定: {len(ph_merged)}件 "
                    f"（門前:{sum(1 for p in ph_merged if p.pharmacy_type=='門前薬局')}件 "
                    f"面:{sum(1 for p in ph_merged if p.pharmacy_type=='面薬局')}件）")
@@ -1837,6 +1859,12 @@ if st.session_state.results:
             needs_check = "要確認" in fac.distance_note
             if needs_check:
                 needs_check_count += 1
+            # 門前薬局表示テキスト
+            if fac.monzen_pharmacy_name and fac.monzen_pharmacy_name != "なし":
+                monzen_label = (f"あり：{fac.monzen_pharmacy_name}"
+                                f"（{int(fac.monzen_pharmacy_dist_m)}m）")
+            else:
+                monzen_label = fac.monzen_pharmacy_name  # "なし" or "不明（座標なし）"
             rows.append({
                 "ゾーン":        get_zone_label(fac.distance_m, zones_saved),
                 "施設名":        fac.name,
@@ -1850,6 +1878,9 @@ if st.session_state.results:
                 "1日外来患者数": fac.daily_outpatients,
                 "外来出典":      fac.daily_outpatients_source,
                 "週診療日数":    fac.weekly_op_days,
+                "門前薬局":      monzen_label,
+                "年間処方箋数":  fac.monzen_rx_count,
+                "処方箋数出典":  fac.monzen_rx_source if fac.monzen_rx_count else "—",
                 "住所":          fac.address,
             })
         df = pd.DataFrame(rows)
@@ -1878,6 +1909,9 @@ if st.session_state.results:
                 "1日外来患者数":  st.column_config.NumberColumn("1日外来", format="%d 人/日", width="small"),
                 "外来出典":       st.column_config.TextColumn("外来出典", width="medium"),
                 "週診療日数":     st.column_config.NumberColumn("週診療日", format="%.1f 日", width="small"),
+                "門前薬局":       st.column_config.TextColumn("門前薬局（50m以内）", width="large"),
+                "年間処方箋数":   st.column_config.NumberColumn("年間処方箋数", format="%d 枚", width="small"),
+                "処方箋数出典":   st.column_config.TextColumn("処方箋数出典", width="medium"),
                 "住所":           st.column_config.TextColumn("住所", width="large"),
             },
         )
@@ -1916,6 +1950,10 @@ if st.session_state.results:
                 "1日外来患者数":    f.daily_outpatients or "",
                 "外来患者数出典":   f.daily_outpatients_source,
                 "週平均診療日数":   f.weekly_op_days or "",
+                "門前薬局":         f.monzen_pharmacy_name,
+                "門前薬局距離_m":   int(f.monzen_pharmacy_dist_m) if f.monzen_pharmacy_dist_m else "",
+                "年間処方箋数_門前": f.monzen_rx_count or "",
+                "処方箋数出典":     f.monzen_rx_source if f.monzen_rx_count else "—",
                 "データソース":     f.source,
                 "MHLW_URL":         f.detail_url,
             }
