@@ -102,6 +102,29 @@ PREFECTURE_CODES: Dict[str, str] = {
 
 # ─── データクラス ──────────────────────────────────────────────────────────────
 @dataclass
+class PharmacyFacility:
+    """薬局情報（門前/面判定・総取扱処方箋数付き）"""
+    name: str
+    address: str
+    href: str = ""
+    pref_cd: str = ""
+    kikan_cd: str = ""
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    distance_m: Optional[float] = None        # 検索中心からの距離
+    source: str = "mhlw"
+    pharmacy_type: str = "不明"               # "門前薬局" / "面薬局" / "不明"
+    nearest_clinic_name: str = "—"           # 最近接の医療機関名
+    nearest_clinic_dist_m: Optional[float] = None   # 最近接の医療機関との距離
+    annual_rx_count: Optional[int] = None    # 年間総取扱処方箋数
+    annual_rx_source: str = "—"
+    detail_fetched: bool = False
+    detail_url: str = ""
+    distance_note: str = ""
+    raw_fields: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class MedFacility:
     name: str
     address: str
@@ -401,6 +424,84 @@ out center;
     return facilities
 
 
+def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List[PharmacyFacility]:
+    """OSM Overpass API で半径圏内の薬局を取得。"""
+    query = f"""
+[out:json][timeout:40];
+(
+  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+);
+out center;
+"""
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": query}, timeout=35)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception:
+        return []
+
+    pharmacies: List[PharmacyFacility] = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        name = tags.get("name:ja") or tags.get("name", "")
+        if not name:
+            continue
+        if el["type"] == "node":
+            f_lat, f_lon = el.get("lat"), el.get("lon")
+        else:
+            center = el.get("center", {})
+            f_lat, f_lon = center.get("lat"), center.get("lon")
+        if f_lat is None or f_lon is None:
+            continue
+        addr_parts = [
+            tags.get("addr:province", ""),
+            tags.get("addr:city", "") or tags.get("addr:district", ""),
+            tags.get("addr:suburb", ""),
+            tags.get("addr:housenumber", ""),
+        ]
+        address = re.sub(r"\s+", "", "".join(p for p in addr_parts if p))
+        dist = haversine(lat, lon, f_lat, f_lon)
+        pharmacies.append(PharmacyFacility(
+            name=name, address=address, source="osm",
+            lat=f_lat, lon=f_lon, distance_m=dist,
+            distance_note="OSM座標（高精度）",
+        ))
+
+    pharmacies.sort(key=lambda x: x.distance_m or 9_999_999)
+    return pharmacies
+
+
+def determine_pharmacy_types(
+    pharmacies: List[PharmacyFacility],
+    med_facilities: List[MedFacility],
+    threshold_m: float = 50.0,
+) -> None:
+    """各薬局について最近接の医療機関を特定し、門前/面を判定する（in-place）。"""
+    for ph in pharmacies:
+        if ph.lat is None or ph.lon is None:
+            ph.pharmacy_type = "不明（座標なし）"
+            continue
+        best_dist = float("inf")
+        best_name = "—"
+        for mf in med_facilities:
+            if mf.lat is None or mf.lon is None:
+                continue
+            d = haversine(ph.lat, ph.lon, mf.lat, mf.lon)
+            if d < best_dist:
+                best_dist = d
+                best_name = mf.name
+        ph.nearest_clinic_dist_m = best_dist if best_dist < float("inf") else None
+        ph.nearest_clinic_name = best_name
+        if best_dist <= threshold_m:
+            ph.pharmacy_type = "門前薬局"
+        elif best_dist < float("inf"):
+            ph.pharmacy_type = "面薬局"
+        else:
+            ph.pharmacy_type = "不明（医療機関なし）"
+
+
 # ─── MHLWスクレイパー ──────────────────────────────────────────────────────────
 class MHLWScraper:
     def __init__(self):
@@ -511,6 +612,136 @@ class MHLWScraper:
         msg = (f"MHLW: 緯度{lat:.4f}/経度{lon:.4f} {dist_str} "
                f"→ 全{total}件 / 取得{len(all_cands)}件")
         return all_cands, msg
+
+    def search_pharmacies_by_latlon(
+        self,
+        lat: float, lon: float,
+        radius_m: int,
+        center_name: str = "",
+        max_pages: int = 8,
+    ) -> Tuple[List[PharmacyFacility], str]:
+        """ナビィで薬局（kikanKbn=5）を緯度経度検索する。"""
+        if not self._init():
+            return [], "MHLW接続エラー"
+        dist_code = "00" if radius_m <= 1_000 else ("01" if radius_m <= 5_000 else "")
+        try:
+            self.session.get(f"{MHLW_BASE}/juminkanja/S2320/initsearch", timeout=12)
+            r2 = self.session.get(
+                f"{MHLW_BASE}/juminkanja/S2320/search",
+                params={
+                    "specifyDateAndTime": "01",
+                    "centerPointName": urllib.parse.quote(center_name or "検索地点"),
+                    "latitude": str(lat),
+                    "longitude": str(lon),
+                    "selectCenterPoint": "",
+                    "distanceFromCenterPoint": dist_code,
+                    "medicalCare": ["5"],     # 5=薬局
+                    "searchTypes": "01-2",
+                },
+                timeout=15,
+            )
+            j = r2.json()
+            if j.get("code") != "0":
+                return [], f"薬局検索エラー: {j.get('messages')}"
+            redirect_url = j["result"]["redirectUrl"]
+        except Exception as e:
+            return [], f"薬局検索例外: {e}"
+
+        all_ph: List[PharmacyFacility] = []
+        total = 0
+        for page in range(max_pages):
+            try:
+                sep = "&" if "?" in redirect_url else "?"
+                r3 = self.session.get(
+                    f"{redirect_url}{sep}page={page}&size=20&sortNo=2", timeout=15)
+                if r3.status_code != 200:
+                    break
+                phs, t = self._parse_pharmacy_list(r3.text)
+                if page == 0:
+                    total = t
+                if not phs:
+                    break
+                all_ph.extend(phs)
+                if len(all_ph) >= total:
+                    break
+                time.sleep(0.3)
+            except Exception:
+                break
+
+        dist_str = f"{radius_m//1000}km" if radius_m >= 1000 else f"{radius_m}m"
+        return all_ph, f"ナビィ薬局: {dist_str}圏内 全{total}件 / 取得{len(all_ph)}件"
+
+    def _parse_pharmacy_list(self, html: str) -> Tuple[List[PharmacyFacility], int]:
+        """S2400 薬局一覧ページからPharmacyFacilityリストを生成する。"""
+        soup = BeautifulSoup(html, "html.parser")
+        results: List[PharmacyFacility] = []
+        total = 0
+        m = re.search(r"(\d{1,6})\s*件", soup.get_text())
+        if m:
+            total = int(m.group(1))
+        for item in soup.find_all("div", class_="item"):
+            h3 = item.find("h3", class_="name")
+            if not h3:
+                continue
+            link = h3.find("a", href=True)
+            if not link:
+                continue
+            name = link.get_text(strip=True)
+            href = link.get("href", "")
+            if href.startswith("/"):
+                href = MHLW_DOMAIN + href
+            pref_cd = re.search(r"prefCd=(\d+)", href)
+            kikan_cd = re.search(r"kikanCd=(\w+)", href)
+            pref_cd = pref_cd.group(1) if pref_cd else ""
+            kikan_cd = kikan_cd.group(1) if kikan_cd else ""
+            addr_tag = item.find("p", class_=re.compile(r"address|addr"))
+            address = addr_tag.get_text(strip=True) if addr_tag else ""
+            results.append(PharmacyFacility(
+                name=name, address=address, href=href,
+                pref_cd=pref_cd, kikan_cd=kikan_cd, source="mhlw",
+            ))
+        return results, total
+
+    def get_pharmacy_detail(self, ph: PharmacyFacility) -> bool:
+        """ナビィ薬局詳細ページから総取扱処方箋数を取得する。"""
+        self._init()
+        if not (ph.pref_cd and ph.kikan_cd):
+            return False
+        url = (f"{MHLW_BASE}/juminkanja/S2430/initialize"
+               f"?prefCd={ph.pref_cd}&kikanCd={ph.kikan_cd}&kikanKbn=5")
+        try:
+            r = self.session.get(url, timeout=12)
+            if r.status_code != 200:
+                return False
+            soup = BeautifulSoup(r.text, "html.parser")
+            text = soup.get_text(separator="\n", strip=True)
+            if "E-0109" in text or "データは存在しません" in text:
+                return False
+        except Exception:
+            return False
+
+        ph.detail_url = url
+
+        # 全フィールド収集
+        all_fields: Dict[str, str] = {}
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) >= 2:
+                k = cells[0].get_text(strip=True)
+                v = " / ".join(c.get_text(strip=True) for c in cells[1:] if c.get_text(strip=True))
+                if k and v:
+                    all_fields[k] = v
+        for dl in soup.find_all("dl"):
+            for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
+                k, v = dt.get_text(strip=True), dd.get_text(strip=True)
+                if k and v:
+                    all_fields[k] = v
+        ph.raw_fields = all_fields
+
+        # 総取扱処方箋数を抽出
+        ph.annual_rx_count, ph.annual_rx_source = _parse_annual_rx_count(all_fields, text)
+        ph.detail_fetched = True
+        return True
 
     def _parse_list(self, html: str) -> Tuple[List[MedFacility], int]:
         """S2400 一覧ページから施設情報を抽出する。"""
@@ -680,6 +911,61 @@ class MHLWScraper:
 
 
 # ─── フィールドパーサ群 ────────────────────────────────────────────────────────
+def _parse_annual_rx_count(
+    fields: Dict[str, str], full_text: str
+) -> Tuple[Optional[int], str]:
+    """
+    薬局の年間総取扱処方箋数を抽出。
+    Returns: (count, source_description)
+    """
+    candidate_keys = [
+        "処方箋受付回数（年間）",
+        "処方箋受付枚数（年間）",
+        "処方箋受付回数",
+        "処方箋受付枚数",
+        "調剤処方箋の受付枚数",
+        "取扱処方箋数",
+        "総取扱処方箋数",
+        "年間処方箋受付回数",
+        "年間処方箋取扱枚数",
+        "処方箋枚数",
+    ]
+    for k in candidate_keys:
+        v = None
+        if k in fields:
+            v = fields[k]
+        else:
+            for fk, fv in fields.items():
+                if k in fk:
+                    v = fv
+                    break
+        if v:
+            m = re.search(r"([\d,]+)", v)
+            if m:
+                try:
+                    n = int(m.group(1).replace(",", ""))
+                    if 100 <= n <= 10_000_000:
+                        return n, f"ナビィ（{k}）"
+                except ValueError:
+                    pass
+
+    for pat, label in [
+        (r"処方箋受付(?:回数|枚数)[^\d]{0,10}([\d,]+)", "ナビィ（テキスト解析）"),
+        (r"取扱処方箋(?:数|枚)[^\d]{0,10}([\d,]+)", "ナビィ（テキスト解析）"),
+        (r"処方箋[^\d]{0,8}([\d,]+)\s*(?:回|枚|件)", "ナビィ（テキスト解析）"),
+    ]:
+        m = re.search(pat, full_text)
+        if m:
+            try:
+                n = int(m.group(1).replace(",", ""))
+                if 100 <= n <= 10_000_000:
+                    return n, label
+            except ValueError:
+                pass
+
+    return None, "—"
+
+
 def _get_field(fields: Dict[str, str], keys: List[str]) -> Optional[str]:
     """複数の候補キーのうち、最初にマッチしたフィールド値を返す"""
     for k in keys:
@@ -1071,6 +1357,7 @@ def get_zone_label(distance_m: Optional[float], zones: List[int]) -> str:
 # ─── セッション状態 ────────────────────────────────────────────────────────────
 _defaults = {
     "results": [],
+    "pharmacies": [],
     "center_lat": None,
     "center_lon": None,
     "search_log": [],
@@ -1151,6 +1438,17 @@ with st.sidebar:
         value=True,
         help="OpenStreetMap Overpass API で半径圏内の施設を追加取得。\n"
              "MHLWにない施設も含めて網羅的に検索できます。",
+    )
+    search_pharmacies = st.checkbox(
+        "💊 近隣薬局も検索する",
+        value=True,
+        help="圏内の調剤薬局をOSM + ナビィで検索し、門前/面を自動判定します。\n"
+             "ナビィから年間総取扱処方箋数も取得します。",
+    )
+    pharmacy_gate_m = st.number_input(
+        "門前判定距離 (m)",
+        min_value=10, max_value=500, value=50, step=10,
+        help="医療機関との距離がこの値以内の薬局を「門前薬局」と判定します。",
     )
     verify_distance = st.checkbox(
         "🔍 距離二重確認モード",
@@ -1407,7 +1705,61 @@ if run_btn and address_input.strip():
 
     results = merged
 
+    # ── Step9: 近隣薬局検索 + 門前/面判定 ────────────────────────────────
+    pharmacies: List[PharmacyFacility] = []
+    if search_pharmacies:
+        prog.progress(99, text="💊 近隣薬局を検索中（OSM）…")
+        ph_osm = search_osm_pharmacies(center_lat, center_lon, radius_m)
+        log.append(f"💊 OSM薬局: {len(ph_osm)}件")
+
+        prog.progress(99, text="💊 近隣薬局をナビィで検索中…")
+        ph_mhlw, msg_ph = scraper.search_pharmacies_by_latlon(
+            center_lat, center_lon, radius_m=radius_m,
+            center_name=area_kw, max_pages=8,
+        )
+        log.append(f"💊 {msg_ph}")
+
+        # マージ（名前重複排除）
+        ph_merged: List[PharmacyFacility] = list(ph_osm)
+        ph_osm_names = [p.name for p in ph_osm]
+        for ph in ph_mhlw:
+            if any(name_similarity(ph.name, n) >= 0.70 for n in ph_osm_names):
+                continue
+            ph_merged.append(ph)
+
+        # MHLWのみの薬局をジオコーディング
+        prog.progress(99, text="💊 薬局の住所を座標変換中…")
+        for ph in ph_merged:
+            if ph.lat is None and ph.address:
+                gc = _geocoder.geocode(ph.address)
+                if gc:
+                    ph.lat, ph.lon = gc
+                    ph.distance_m = haversine(center_lat, center_lon, ph.lat, ph.lon)
+                time.sleep(0.1)
+
+        # 半径外を除外
+        ph_merged = [p for p in ph_merged
+                     if p.distance_m is not None and p.distance_m <= radius_m]
+        ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
+
+        # 門前/面判定
+        coords_mf = [mf for mf in results if mf.lat and mf.lon]
+        determine_pharmacy_types(ph_merged, coords_mf, threshold_m=float(pharmacy_gate_m))
+        log.append(f"💊 薬局確定: {len(ph_merged)}件 "
+                   f"（門前:{sum(1 for p in ph_merged if p.pharmacy_type=='門前薬局')}件 "
+                   f"面:{sum(1 for p in ph_merged if p.pharmacy_type=='面薬局')}件）")
+
+        # ナビィ詳細取得（処方箋数）
+        ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd][:30]
+        for i, ph in enumerate(ph_targets):
+            prog.progress(99, text=f"💊 薬局詳細取得中 ({i+1}/{len(ph_targets)}): {ph.name[:18]}…")
+            scraper.get_pharmacy_detail(ph)
+            time.sleep(0.6)
+        log.append(f"💊 薬局詳細取得: {sum(1 for p in ph_merged if p.detail_fetched)}件")
+        pharmacies = ph_merged
+
     st.session_state.results = results
+    st.session_state.pharmacies = pharmacies
     st.session_state.center_lat = center_lat
     st.session_state.center_lon = center_lon
     st.session_state.search_log = log
@@ -1421,6 +1773,7 @@ if run_btn and address_input.strip():
 # ── 結果表示 ──────────────────────────────────────────────────────────────────
 if st.session_state.results:
     results: List[MedFacility] = st.session_state.results
+    pharmacies: List[PharmacyFacility] = st.session_state.get("pharmacies", [])
     center_lat = st.session_state.center_lat
     center_lon = st.session_state.center_lon
     zones_saved = st.session_state.last_zones   # 可変長リスト（3〜5要素）
@@ -1449,8 +1802,8 @@ if st.session_state.results:
             delta_color="off",
         )
 
-    tab_table, tab_map, tab_debug, tab_log = st.tabs(
-        ["📋 一覧表", "🗺️ 地図", "🔬 デバッグ", "📝 ログ"])
+    tab_table, tab_pharmacy, tab_map, tab_debug, tab_log = st.tabs(
+        ["📋 医療機関一覧", f"💊 近隣薬局({len(pharmacies)}件)", "🗺️ 地図", "🔬 デバッグ", "📝 ログ"])
 
     # ── 一覧表 ────────────────────────────────────────────────────────────
     with tab_table:
@@ -1575,6 +1928,93 @@ if st.session_state.results:
             mime="text/csv",
         )
 
+    # ── 近隣薬局タブ ──────────────────────────────────────────────────────
+    with tab_pharmacy:
+        if not pharmacies:
+            st.info("「💊 近隣薬局も検索する」をONにして再検索すると薬局情報が表示されます。")
+        else:
+            # サマリーカード
+            ph_monzen = [p for p in pharmacies if p.pharmacy_type == "門前薬局"]
+            ph_men    = [p for p in pharmacies if p.pharmacy_type == "面薬局"]
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.metric("薬局 合計", f"{len(pharmacies)}件")
+            pc2.metric("🏥 門前薬局", f"{len(ph_monzen)}件",
+                       delta=f"医療機関{int(pharmacy_gate_m)}m以内", delta_color="off")
+            pc3.metric("🏪 面薬局", f"{len(ph_men)}件")
+
+            # フィルター
+            pf1, pf2 = st.columns(2)
+            ph_type_filter = pf1.selectbox(
+                "薬局種別", ["すべて", "門前薬局", "面薬局", "不明"])
+            ph_sort = pf2.selectbox(
+                "並び順", ["距離（近い順）", "処方箋数（多い順）", "施設名"])
+
+            ph_filtered = list(pharmacies)
+            if ph_type_filter != "すべて":
+                ph_filtered = [p for p in ph_filtered if p.pharmacy_type == ph_type_filter]
+            if ph_sort == "処方箋数（多い順）":
+                ph_filtered.sort(key=lambda x: x.annual_rx_count or 0, reverse=True)
+            elif ph_sort == "施設名":
+                ph_filtered.sort(key=lambda x: x.name)
+            else:
+                ph_filtered.sort(key=lambda x: x.distance_m or 9_999_999)
+
+            ph_rows = []
+            for p in ph_filtered:
+                ph_rows.append({
+                    "薬局種別":       p.pharmacy_type,
+                    "薬局名":         p.name,
+                    "距離(m)":        int(p.distance_m) if p.distance_m else None,
+                    "年間処方箋数":   p.annual_rx_count,
+                    "処方箋数出典":   p.annual_rx_source,
+                    "最近接医療機関": p.nearest_clinic_name,
+                    "医療機関距離(m)":int(p.nearest_clinic_dist_m)
+                                    if p.nearest_clinic_dist_m else None,
+                    "住所":           p.address,
+                })
+            ph_df = pd.DataFrame(ph_rows)
+            st.caption(f"表示: {len(ph_rows)}件 / 全{len(pharmacies)}件")
+            st.dataframe(
+                ph_df,
+                use_container_width=True,
+                height=460,
+                column_config={
+                    "薬局種別":       st.column_config.TextColumn("種別", width="small"),
+                    "薬局名":         st.column_config.TextColumn("薬局名", width="medium"),
+                    "距離(m)":        st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
+                    "年間処方箋数":   st.column_config.NumberColumn("年間処方箋数", format="%d 枚", width="small"),
+                    "処方箋数出典":   st.column_config.TextColumn("処方箋数出典", width="medium"),
+                    "最近接医療機関": st.column_config.TextColumn("最近接医療機関", width="medium"),
+                    "医療機関距離(m)":st.column_config.NumberColumn("医療機関距離", format="%d m", width="small"),
+                    "住所":           st.column_config.TextColumn("住所", width="large"),
+                },
+            )
+
+            # CSV ダウンロード
+            st.divider()
+            area_kw_ph = extract_area_keyword(st.session_state.last_address)
+            ph_csv_rows = [
+                {
+                    "薬局種別":           p.pharmacy_type,
+                    "薬局名":             p.name,
+                    "住所":               p.address,
+                    "距離_m":             int(p.distance_m) if p.distance_m else "",
+                    "年間総取扱処方箋数": p.annual_rx_count or "",
+                    "処方箋数出典":       p.annual_rx_source,
+                    "最近接医療機関":     p.nearest_clinic_name,
+                    "医療機関距離_m":     int(p.nearest_clinic_dist_m)
+                                          if p.nearest_clinic_dist_m else "",
+                    "MHLW_URL":           p.detail_url,
+                }
+                for p in pharmacies
+            ]
+            st.download_button(
+                "⬇️ 薬局リスト CSV ダウンロード",
+                data=pd.DataFrame(ph_csv_rows).to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"pharmacies_{area_kw_ph}.csv",
+                mime="text/csv",
+            )
+
     # ── 地図 ──────────────────────────────────────────────────────────────
     with tab_map:
         m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
@@ -1630,12 +2070,36 @@ if st.session_state.results:
                 icon=folium.Icon(color=color, icon=icon_name, prefix="fa"),
             ).add_to(m)
 
+        # 薬局マーカー追加
+        for ph in pharmacies:
+            if ph.lat is None or ph.lon is None:
+                continue
+            ph_color = "blue" if ph.pharmacy_type == "門前薬局" else "lightblue"
+            ph_popup = f"""
+<div style="min-width:210px;font-family:sans-serif;font-size:13px">
+  <b>💊 {ph.name}</b><br>
+  <span style="color:#64748b;font-size:11px">{ph.address or '—'}</span><br>
+  <hr style="margin:4px 0">
+  📏 <b>{ph.distance_m:,.0f} m</b><br>
+  🏷 <b>{ph.pharmacy_type}</b><br>
+  🏥 最近接: {ph.nearest_clinic_name[:20]}（{ph.nearest_clinic_dist_m:,.0f}m）<br>
+  📋 年間処方箋数: <b>{f"{ph.annual_rx_count:,}枚" if ph.annual_rx_count else "—"}</b><br>
+  {'<a href="' + ph.detail_url + '" target="_blank" style="font-size:11px">🔗 MHLWページ</a>' if ph.detail_url else ''}
+</div>"""
+            folium.Marker(
+                [ph.lat, ph.lon],
+                popup=folium.Popup(ph_popup, max_width=260),
+                tooltip=f"💊 {ph.name}（{ph.pharmacy_type}）",
+                icon=folium.Icon(color=ph_color, icon="plus-square", prefix="fa"),
+            ).add_to(m)
+
         st_folium(m, width="stretch", height=560)
         circle_legend = "　".join(
             f"{_ZONE_ICONS[i]} Z{i+1}円" for i in range(len(zones_saved))
         )
         st.markdown(
             f"🟢 院外処方あり　🟠 院内処方のみ　🟣 病院　⚫ 不明　🔴 薬局候補地  \n"
+            f"🔵 門前薬局　🩵 面薬局  \n"
             f"{circle_legend}"
         )
 
