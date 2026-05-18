@@ -482,38 +482,61 @@ def assign_monzen_to_clinics(
     med_facilities: List[MedFacility],
     pharmacies: List[PharmacyFacility],
     threshold_m: float = 50.0,
-) -> None:
+) -> List[str]:
     """
-    各医療機関の門前50m以内に薬局があるか判定し、MedFacilityに書き込む（in-place）。
+    各医療機関の門前N m以内に薬局があるか判定し、MedFacilityに書き込む（in-place）。
     同時に、薬局側にも最近接医療機関を記録する。
+    デバッグ用ログ行のリストを返す。
     """
+    debug_lines: List[str] = []
+    ph_with_coords = [ph for ph in pharmacies if ph.lat is not None and ph.lon is not None]
+    debug_lines.append(
+        f"🔍 門前判定: 対象医療機関={len(med_facilities)}件 "
+        f"薬局(座標あり)={len(ph_with_coords)}/{len(pharmacies)}件 "
+        f"閾値={threshold_m:.0f}m"
+    )
+
     for mf in med_facilities:
         if mf.lat is None or mf.lon is None:
             mf.monzen_pharmacy_name = "不明（座標なし）"
+            debug_lines.append(f"  ⚠️ {mf.name[:20]} → 座標なし（スキップ）")
             continue
+
         best_dist = float("inf")
         best_ph: Optional[PharmacyFacility] = None
-        for ph in pharmacies:
-            if ph.lat is None or ph.lon is None:
-                continue
+        for ph in ph_with_coords:
             d = haversine(mf.lat, mf.lon, ph.lat, ph.lon)
             if d < best_dist:
                 best_dist = d
                 best_ph = ph
+
         # 薬局側にも最近接医療機関を記録
         if best_ph is not None:
             if best_ph.nearest_clinic_dist_m is None or best_dist < best_ph.nearest_clinic_dist_m:
                 best_ph.nearest_clinic_name = mf.name
                 best_ph.nearest_clinic_dist_m = best_dist
+
         # 医療機関側に門前情報を書き込む
         if best_ph is not None and best_dist <= threshold_m:
             mf.monzen_pharmacy_name = best_ph.name
             mf.monzen_pharmacy_dist_m = best_dist
             mf.monzen_rx_count = best_ph.annual_rx_count
             mf.monzen_rx_source = best_ph.annual_rx_source
+            debug_lines.append(
+                f"  ✅ {mf.name[:20]} → 門前あり: {best_ph.name[:20]} ({best_dist:.0f}m)"
+            )
+        elif best_ph is not None:
+            # 最近接薬局はあるが閾値外 → 距離を記録して「なし」
+            mf.monzen_pharmacy_name = "なし"
+            mf.monzen_pharmacy_dist_m = best_dist   # ← 「なし」でも最近接距離を保持
+            debug_lines.append(
+                f"  ➖ {mf.name[:20]} → なし（最近接: {best_ph.name[:20]} {best_dist:.0f}m > {threshold_m:.0f}m）"
+            )
         else:
+            # 座標付き薬局が1件もない
             mf.monzen_pharmacy_name = "なし"
             mf.monzen_pharmacy_dist_m = None
+            debug_lines.append(f"  ➖ {mf.name[:20]} → なし（近隣に薬局データなし）")
 
     # 薬局側の門前/面ラベルも付与（薬局タブ用）
     for ph in pharmacies:
@@ -523,6 +546,8 @@ def assign_monzen_to_clinics(
             ph.pharmacy_type = "面薬局"
         else:
             ph.pharmacy_type = "不明"
+
+    return debug_lines
 
 
 # ─── MHLWスクレイパー ──────────────────────────────────────────────────────────
@@ -1765,19 +1790,20 @@ if run_btn and address_input.strip():
                      if p.distance_m is not None and p.distance_m <= radius_m]
         ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
 
-        # 医療機関視点の門前判定（各クリニックに薬局情報を付与）
-        assign_monzen_to_clinics(results, ph_merged, threshold_m=float(pharmacy_gate_m))
-        log.append(f"💊 薬局確定: {len(ph_merged)}件 "
-                   f"（門前:{sum(1 for p in ph_merged if p.pharmacy_type=='門前薬局')}件 "
-                   f"面:{sum(1 for p in ph_merged if p.pharmacy_type=='面薬局')}件）")
-
-        # ナビィ詳細取得（処方箋数）
+        # ナビィ詳細取得（処方箋数）← 門前判定より先に実行して annual_rx_count を確定
         ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd][:30]
         for i, ph in enumerate(ph_targets):
             prog.progress(99, text=f"💊 薬局詳細取得中 ({i+1}/{len(ph_targets)}): {ph.name[:18]}…")
             scraper.get_pharmacy_detail(ph)
             time.sleep(0.6)
         log.append(f"💊 薬局詳細取得: {sum(1 for p in ph_merged if p.detail_fetched)}件")
+
+        # 医療機関視点の門前判定（各クリニックに薬局情報を付与）
+        monzen_debug = assign_monzen_to_clinics(results, ph_merged, threshold_m=float(pharmacy_gate_m))
+        log.extend(monzen_debug)
+        log.append(f"💊 薬局確定: {len(ph_merged)}件 "
+                   f"（門前:{sum(1 for p in ph_merged if p.pharmacy_type=='門前薬局')}件 "
+                   f"面:{sum(1 for p in ph_merged if p.pharmacy_type=='面薬局')}件）")
         pharmacies = ph_merged
 
     st.session_state.results = results
@@ -1860,11 +1886,15 @@ if st.session_state.results:
             if needs_check:
                 needs_check_count += 1
             # 門前薬局表示テキスト
-            if fac.monzen_pharmacy_name and fac.monzen_pharmacy_name != "なし":
+            if fac.monzen_pharmacy_name and fac.monzen_pharmacy_name not in ("なし", "不明（座標なし）"):
+                # 門前あり
                 monzen_label = (f"あり：{fac.monzen_pharmacy_name}"
                                 f"（{int(fac.monzen_pharmacy_dist_m)}m）")
+            elif fac.monzen_pharmacy_name == "なし" and fac.monzen_pharmacy_dist_m is not None:
+                # 最近接薬局はあるが閾値外 → 距離を添えて表示
+                monzen_label = f"なし（最近接 {int(fac.monzen_pharmacy_dist_m)}m）"
             else:
-                monzen_label = fac.monzen_pharmacy_name  # "なし" or "不明（座標なし）"
+                monzen_label = fac.monzen_pharmacy_name or "なし"
             rows.append({
                 "ゾーン":        get_zone_label(fac.distance_m, zones_saved),
                 "施設名":        fac.name,
