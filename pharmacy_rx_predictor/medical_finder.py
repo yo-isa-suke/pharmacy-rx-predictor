@@ -53,8 +53,36 @@ st.set_page_config(
 # ─── 定数 ─────────────────────────────────────────────────────────────────────
 MHLW_DOMAIN  = "https://www.iryou.teikyouseido.mhlw.go.jp"
 MHLW_BASE    = MHLW_DOMAIN + "/znk-web"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_MIRRORS = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 WORKING_DAYS = 305
+
+
+def _overpass_post(query: str, timeout: int = 40, retries: int = 2) -> Optional[dict]:
+    """
+    複数のOverpassミラーを順番に試してJSONを返す。
+    429/503 はレート制限なので待機してリトライする。全失敗時はNoneを返す。
+    """
+    for attempt in range(retries + 1):
+        for url in OVERPASS_MIRRORS:
+            try:
+                r = requests.post(url, data={"data": query}, timeout=timeout)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code in (429, 503):
+                    time.sleep(5 + attempt * 5)
+                    break   # 別ミラーよりも少し待ってから同じミラーを再試行
+            except requests.exceptions.Timeout:
+                continue
+            except Exception:
+                continue
+        if attempt < retries:
+            time.sleep(3 + attempt * 3)
+    return None
+
 
 # kikanCd 先頭桁 → kikanKbn の推定マッピング
 # 1=病院, 2=診療所（一般）, 3=歯科, 4=助産所, 5=薬局
@@ -364,12 +392,8 @@ def search_osm_medical(lat: float, lon: float, radius_m: int) -> List[MedFacilit
 );
 out center;
 """
-    try:
-        r = requests.post(OVERPASS_URL, data={"data": query}, timeout=35)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    except Exception:
+    data = _overpass_post(query)
+    if data is None:
         return []
 
     facilities: List[MedFacility] = []
@@ -439,12 +463,8 @@ def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List[Pharmac
 );
 out center;
 """
-    try:
-        r = requests.post(OVERPASS_URL, data={"data": query}, timeout=35)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    except Exception:
+    data = _overpass_post(query)
+    if data is None:
         return []
 
     pharmacies: List[PharmacyFacility] = []
@@ -1756,16 +1776,20 @@ if run_btn and address_input.strip():
     # ── Step9: 近隣薬局検索 + 門前/面判定 ────────────────────────────────
     pharmacies: List[PharmacyFacility] = []
     if search_pharmacies:
+        # 医療機関OSM検索との連続リクエストによるレート制限を避けるため少し待機
+        time.sleep(3)
         prog.progress(99, text="💊 近隣薬局を検索中（OSM）…")
         ph_osm = search_osm_pharmacies(center_lat, center_lon, radius_m)
-        log.append(f"💊 OSM薬局: {len(ph_osm)}件")
+        log.append(f"💊 OSM薬局（生）: {len(ph_osm)}件")
+        for _ph in ph_osm:
+            log.append(f"   OSM: {_ph.name} dist={_ph.distance_m:.0f}m lat={_ph.lat}")
 
         prog.progress(99, text="💊 近隣薬局をナビィで検索中…")
         ph_mhlw, msg_ph = scraper.search_pharmacies_by_latlon(
             center_lat, center_lon, radius_m=radius_m,
             center_name=area_kw, max_pages=8,
         )
-        log.append(f"💊 {msg_ph}")
+        log.append(f"💊 {msg_ph} → MHLW生: {len(ph_mhlw)}件")
 
         # マージ（名前重複排除）
         ph_merged: List[PharmacyFacility] = list(ph_osm)
@@ -1774,6 +1798,7 @@ if run_btn and address_input.strip():
             if any(name_similarity(ph.name, n) >= 0.70 for n in ph_osm_names):
                 continue
             ph_merged.append(ph)
+        log.append(f"💊 マージ後（フィルタ前）: {len(ph_merged)}件")
 
         # MHLWのみの薬局をジオコーディング
         prog.progress(99, text="💊 薬局の住所を座標変換中…")
@@ -1783,11 +1808,16 @@ if run_btn and address_input.strip():
                 if gc:
                     ph.lat, ph.lon = gc
                     ph.distance_m = haversine(center_lat, center_lon, ph.lat, ph.lon)
+                    log.append(f"   GC: {ph.name} → {ph.distance_m:.0f}m")
+                else:
+                    log.append(f"   GC失敗: {ph.name} 住所={ph.address}")
                 time.sleep(0.1)
 
         # 半径外を除外
+        before_filter = len(ph_merged)
         ph_merged = [p for p in ph_merged
                      if p.distance_m is not None and p.distance_m <= radius_m]
+        log.append(f"💊 半径フィルタ後: {len(ph_merged)}件（除外: {before_filter - len(ph_merged)}件, radius_m={radius_m}）")
         ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
 
         # ナビィ詳細取得（処方箋数）← 門前判定より先に実行して annual_rx_count を確定
