@@ -453,24 +453,25 @@ out center;
     return facilities
 
 
-def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List[PharmacyFacility]:
-    """OSM Overpass API で半径圏内の薬局を取得。"""
-    query = f"""
-[out:json][timeout:40];
-(
-  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
-  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
-);
-out center;
-"""
-    data = _overpass_post(query)
-    if data is None:
-        return []
-
+def _parse_osm_pharmacy_elements(
+    elements: list,
+    center_lat: float,
+    center_lon: float,
+) -> List["PharmacyFacility"]:
+    """OSM elementsリストをPharmacyFacilityに変換する共通処理。"""
     pharmacies: List[PharmacyFacility] = []
-    for el in data.get("elements", []):
+    seen_ids: set = set()
+    for el in elements:
+        el_id = el.get("id")
+        if el_id in seen_ids:
+            continue
+        seen_ids.add(el_id)
         tags = el.get("tags", {})
+        # name:ja優先 → name → branch付きで補完
         name = tags.get("name:ja") or tags.get("name", "")
+        branch = tags.get("branch", "")
+        if branch and branch not in name:
+            name = f"{name}{branch}"
         if not name:
             continue
         if el["type"] == "node":
@@ -487,14 +488,63 @@ out center;
             tags.get("addr:housenumber", ""),
         ]
         address = re.sub(r"\s+", "", "".join(p for p in addr_parts if p))
-        dist = haversine(lat, lon, f_lat, f_lon)
+        dist = haversine(center_lat, center_lon, f_lat, f_lon)
         pharmacies.append(PharmacyFacility(
             name=name, address=address, source="osm",
             lat=f_lat, lon=f_lon, distance_m=dist,
             distance_note="OSM座標（高精度）",
         ))
+    return pharmacies
 
+
+def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List["PharmacyFacility"]:
+    """OSM Overpass API で中心点から半径圏内の薬局を取得。"""
+    query = f"""
+[out:json][timeout:40];
+(
+  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+);
+out center;
+"""
+    data = _overpass_post(query)
+    if data is None:
+        return []
+    pharmacies = _parse_osm_pharmacy_elements(data.get("elements", []), lat, lon)
     pharmacies.sort(key=lambda x: x.distance_m or 9_999_999)
+    return pharmacies
+
+
+def search_osm_pharmacies_near_clinics(
+    clinics: List["MedFacility"],
+    radius_m: int,
+    center_lat: float,
+    center_lon: float,
+) -> List["PharmacyFacility"]:
+    """
+    各医療機関の座標を中心に radius_m 以内の薬局を1回のOverpassクエリで一括取得。
+    入力住所から離れたクリニック近隣の薬局も漏れなく拾う（門前判定精度向上）。
+    """
+    clinic_coords = [(mf.lat, mf.lon) for mf in clinics if mf.lat and mf.lon]
+    if not clinic_coords:
+        return []
+
+    around_nodes = "\n".join(
+        f'  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});'
+        f'\n  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});'
+        for lat, lon in clinic_coords
+    )
+    query = f"""[out:json][timeout:60];
+(
+{around_nodes}
+);
+out center;"""
+    data = _overpass_post(query, timeout=60)
+    if data is None:
+        return []
+    pharmacies = _parse_osm_pharmacy_elements(
+        data.get("elements", []), center_lat, center_lon
+    )
     return pharmacies
 
 
@@ -1791,14 +1841,25 @@ if run_btn and address_input.strip():
         )
         log.append(f"💊 {msg_ph} → MHLW生: {len(ph_mhlw)}件")
 
-        # マージ（名前重複排除）
+        # ── OSM + ナビィ マージ（ナビィ名の方が詳細なので優先して補完）────
         ph_merged: List[PharmacyFacility] = list(ph_osm)
-        ph_osm_names = [p.name for p in ph_osm]
         for ph in ph_mhlw:
-            if any(name_similarity(ph.name, n) >= 0.70 for n in ph_osm_names):
-                continue
-            ph_merged.append(ph)
-        log.append(f"💊 マージ後（フィルタ前）: {len(ph_merged)}件")
+            matched_idx = next(
+                (i for i, osm_ph in enumerate(ph_merged)
+                 if name_similarity(ph.name, osm_ph.name) >= 0.65),
+                None,
+            )
+            if matched_idx is not None:
+                # ナビィ名の方が長い（店舗名含む）なら上書き
+                if len(ph.name) > len(ph_merged[matched_idx].name):
+                    ph_merged[matched_idx].name = ph.name
+                # ナビィのkikanCd等を補完
+                if ph.pref_cd and not ph_merged[matched_idx].pref_cd:
+                    ph_merged[matched_idx].pref_cd = ph.pref_cd
+                    ph_merged[matched_idx].kikan_cd = ph.kikan_cd
+            else:
+                ph_merged.append(ph)
+        log.append(f"💊 OSM+ナビィ マージ後: {len(ph_merged)}件")
 
         # MHLWのみの薬局をジオコーディング
         prog.progress(99, text="💊 薬局の住所を座標変換中…")
@@ -1813,11 +1874,26 @@ if run_btn and address_input.strip():
                     log.append(f"   GC失敗: {ph.name} 住所={ph.address}")
                 time.sleep(0.1)
 
-        # 半径外を除外
+        # 半径外を除外（入力住所中心）
         before_filter = len(ph_merged)
         ph_merged = [p for p in ph_merged
                      if p.distance_m is not None and p.distance_m <= radius_m]
-        log.append(f"💊 半径フィルタ後: {len(ph_merged)}件（除外: {before_filter - len(ph_merged)}件, radius_m={radius_m}）")
+        log.append(f"💊 入力住所基準フィルタ後: {len(ph_merged)}件（除外: {before_filter - len(ph_merged)}件）")
+
+        # ── 各医療機関周辺の薬局を追加取得（門前判定精度向上）────────────
+        # threshold + バッファで各クリニックを囲むOSMクエリを1回で実行
+        gate_r = max(int(pharmacy_gate_m) + 100, 200)
+        prog.progress(99, text=f"💊 各医療機関周辺({gate_r}m)の薬局を追加取得中…")
+        clinic_ph = search_osm_pharmacies_near_clinics(results, gate_r, center_lat, center_lon)
+        existing_names = [p.name for p in ph_merged]
+        added_clinic = 0
+        for ph in clinic_ph:
+            if not any(name_similarity(ph.name, en) >= 0.65 for en in existing_names):
+                ph_merged.append(ph)
+                existing_names.append(ph.name)
+                added_clinic += 1
+        log.append(f"💊 クリニック周辺追加取得: {len(clinic_ph)}件検索 → 新規追加 {added_clinic}件")
+
         ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
 
         # ナビィ詳細取得（処方箋数）← 門前判定より先に実行して annual_rx_count を確定
