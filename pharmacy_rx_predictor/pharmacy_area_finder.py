@@ -515,8 +515,6 @@ class MHLWScraper:
         dist_str = f"{radius_m//1000}km" if radius_m >= 1000 else f"{radius_m}m"
         return all_facs, f"MHLW医療機関: {dist_str}圏内 全{total}件/取得{len(all_facs)}件"
 
-    first_item_text: str = ""  # デバッグ: 最初のitemの生テキストを保持
-
     def _parse_med_list(self, html: str) -> Tuple[List[MedFacility], int]:
         soup = BeautifulSoup(html, "html.parser")
         results: List[MedFacility] = []
@@ -524,10 +522,7 @@ class MHLWScraper:
         m = re.search(r"(\d{1,6})\s*件", soup.get_text())
         if m:
             total = int(m.group(1))
-        items = soup.find_all("div", class_="item")
-        if not MHLWScraper.first_item_text and items:
-            MHLWScraper.first_item_text = items[0].get_text(separator="|", strip=True)[:500]
-        for item in items:
+        for item in soup.find_all("div", class_="item"):
             h3 = item.find("h3", class_="name")
             if not h3:
                 continue
@@ -768,8 +763,6 @@ def run_search(
         center_lat, center_lon, radius_m=med_radius, max_pages=5
     )
     log.append(f"🏥 {med_msg}")
-    if scraper.first_item_text:
-        log.append(f"🔬 HTMLサンプル(1件目): {scraper.first_item_text}")
     med_existing_names = [f.name for f in med_osm]
     geocode_ok, geocode_fail, geocode_skip = 0, 0, 0
     for i, nmf in enumerate(navvi_meds):
@@ -801,9 +794,6 @@ def run_search(
         f"成功={geocode_ok}件 失敗={geocode_fail}件 住所なし={geocode_skip}件"
         f"  合計（座標あり）: {sum(1 for f in med_osm if f.lat is not None)}件"
     )
-    # 診断: 最初の5件の施設名・住所・座標を出力
-    for dbg in navvi_meds[:5]:
-        log.append(f"  🔬 {dbg.name[:25]} | addr={dbg.address[:40] if dbg.address else '(空)'} | lat={dbg.lat}")
 
     # Step5: 薬局詳細取得（処方箋数）
     ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd][:max_detail]
