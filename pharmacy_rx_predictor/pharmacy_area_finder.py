@@ -502,15 +502,22 @@ class MHLWScraper:
             name = link.get_text(strip=True)
             if not name:
                 continue
-            # 住所を抽出（ジオコーディングで座標付与するために必要）
+            # item全体のテキストから住所を抽出（<p>タグ依存を廃止）
+            raw_text = item.get_text(separator=" ", strip=True)
             address = ""
-            for p_tag in item.find_all("p"):
-                raw = p_tag.get_text(" ", strip=True)
-                if "〒" in raw or re.search(r"[都道府県市区町村]", raw):
-                    cleaned = re.sub(r"〒\s*\d{3}[-－]\d{4}", "", raw)
-                    cleaned = re.sub(r"Googleマップで見る", "", cleaned)
-                    address = re.sub(r"\s+", " ", cleaned).strip()[:120]
-                    break
+            # 〒XXXX-XXXX の後ろに続く住所を取得
+            addr_m = re.search(r"〒\s*[\d-]+\s+(.+?)(?:Googleマップ|$)", raw_text)
+            if addr_m:
+                address = re.sub(r"\s+", " ", addr_m.group(1)).strip()[:120]
+            else:
+                # 都道府県名から始まる住所パターン
+                pref_m = re.search(
+                    r"((?:北海道|東京都|大阪府|京都府|[^\s]{2,3}[都道府県])"
+                    r"[^\s]*(?:市|区|町|村)[^\s]*)",
+                    raw_text,
+                )
+                if pref_m:
+                    address = pref_m.group(1)[:120]
             results.append(MedFacility(name=name, address=address, source="mhlw"))
         return results, max(total, len(results))
 
@@ -732,14 +739,18 @@ def run_search(
     )
     log.append(f"🏥 {med_msg}")
     med_existing_names = [f.name for f in med_osm]
-    geocode_ok, geocode_fail = 0, 0
+    geocode_ok, geocode_fail, geocode_skip = 0, 0, 0
+    # 住所が空の場合のフォールバック用: 住所の都道府県を中心住所から推定
+    pref_hint = re.search(r"(?:北海道|東京都|大阪府|京都府|[^\s]{2,3}[都道府県])", address)
+    pref_prefix = pref_hint.group(0) if pref_hint else ""
     for i, nmf in enumerate(navvi_meds):
         if any(name_similarity(nmf.name, en) >= 0.65 for en in med_existing_names):
             # OSM既存エントリと重複 → スキップ（OSMの座標を使う）
             continue
         # 住所からジオコーディングして座標を付与
-        if nmf.address:
-            gc = _geocoder.geocode(nmf.address)
+        geocode_query = nmf.address or (f"{pref_prefix}{nmf.name}" if pref_prefix else "")
+        if geocode_query:
+            gc = _geocoder.geocode(geocode_query)
             if gc:
                 nmf.lat, nmf.lon = gc
                 nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
@@ -747,10 +758,14 @@ def run_search(
             else:
                 geocode_fail += 1
             time.sleep(0.15)  # GSIレート制限対策
+        else:
+            geocode_skip += 1
         med_osm.append(nmf)
         med_existing_names.append(nmf.name)
+    n_with_addr = sum(1 for f in navvi_meds if f.address)
     log.append(
-        f"🏥 ナビィ医療機関ジオコーディング: 成功={geocode_ok}件 失敗={geocode_fail}件"
+        f"🏥 ナビィ医療機関ジオコーディング: 住所あり={n_with_addr}件 "
+        f"成功={geocode_ok}件 失敗={geocode_fail}件 住所なし={geocode_skip}件"
         f"  合計（座標あり）: {sum(1 for f in med_osm if f.lat is not None)}件"
     )
 
