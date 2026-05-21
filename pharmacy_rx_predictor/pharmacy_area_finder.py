@@ -688,6 +688,8 @@ def run_search(
     added_navvi = 0
     prog.progress(40, text=f"💊 ナビィ薬局 {len(navvi_phs)}件の座標を取得中…")
     for i, nph in enumerate(navvi_phs):
+        if i % 5 == 0:
+            prog.progress(40, text=f"💊 薬局座標取得中 {i+1}/{len(navvi_phs)}件…")
         is_dup = any(name_similarity(nph.name, en) >= 0.65 for en in existing_names)
         if is_dup:
             # OSM既存エントリにpref_cd/kikan_cdを補完
@@ -703,13 +705,16 @@ def run_search(
                 nph.lat, nph.lon = gc
                 nph.distance_m = haversine(center_lat, center_lon, nph.lat, nph.lon)
                 if nph.distance_m > radius_m * 1.1:
+                    time.sleep(0.15)
                     continue  # 商圏外
+            time.sleep(0.15)  # GSIレート制限対策
         ph_merged.append(nph)
         existing_names.append(nph.name)
         added_navvi += 1
 
     ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
-    log.append(f"💊 ナビィ固有追加: {added_navvi}件  合計: {len(ph_merged)}件")
+    no_coord = sum(1 for p in ph_merged if p.lat is None)
+    log.append(f"💊 ナビィ固有追加: {added_navvi}件  合計: {len(ph_merged)}件（座標なし: {no_coord}件）")
 
     # Step4: OSM 医療機関検索（門前判定用）
     prog.progress(55, text="🏥 医療機関（門前判定用）を取得中…")
@@ -717,6 +722,8 @@ def run_search(
     time.sleep(2)
     med_osm = search_osm_medical(center_lat, center_lon, med_radius)
     log.append(f"🏥 OSM医療機関: {med_radius}m圏内 {len(med_osm)}件")
+    if len(med_osm) == 0:
+        log.append("⚠️ OSM医療機関が0件 → ナビィ医療機関のみで判定します")
 
     # ナビィ医療機関を取得してジオコーディングで座標付与（OSMの疎な地方部をカバー）
     prog.progress(60, text="🏥 ナビィ医療機関リストを取得中…")
@@ -739,6 +746,7 @@ def run_search(
                 geocode_ok += 1
             else:
                 geocode_fail += 1
+            time.sleep(0.15)  # GSIレート制限対策
         med_osm.append(nmf)
         med_existing_names.append(nmf.name)
     log.append(
