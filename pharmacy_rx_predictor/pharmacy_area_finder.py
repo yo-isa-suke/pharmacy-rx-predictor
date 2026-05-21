@@ -184,6 +184,36 @@ class GeocoderService:
             pass
         return None
 
+    def geocode_by_name(
+        self, name: str, near_lat: float, near_lon: float, radius_km: float = 25
+    ) -> Optional[Tuple[float, float]]:
+        """施設名でNominatimをバウンディングボックス付き検索（住所不明時のフォールバック用）。
+        GSIは住所専用のため施設名検索には使わない。"""
+        delta = radius_km / 111.0
+        viewbox = f"{near_lon - delta},{near_lat + delta},{near_lon + delta},{near_lat - delta}"
+        try:
+            r = requests.get(
+                self.NOMINATIM_URL,
+                params={
+                    "q": name,
+                    "format": "json",
+                    "limit": 3,
+                    "countrycodes": "jp",
+                    "viewbox": viewbox,
+                    "bounded": 1,
+                },
+                headers=self.HEADERS,
+                timeout=8,
+            )
+            if r.status_code == 200:
+                for item in r.json():
+                    lat, lon = float(item["lat"]), float(item["lon"])
+                    if self._is_japan(lat, lon):
+                        return lat, lon
+        except Exception:
+            pass
+        return None
+
     def geocode(self, address: str) -> Optional[Tuple[float, float]]:
         clean = self._clean(address)
         short = self._shorten(clean)
@@ -485,6 +515,8 @@ class MHLWScraper:
         dist_str = f"{radius_m//1000}km" if radius_m >= 1000 else f"{radius_m}m"
         return all_facs, f"MHLW医療機関: {dist_str}圏内 全{total}件/取得{len(all_facs)}件"
 
+    first_item_text: str = ""  # デバッグ: 最初のitemの生テキストを保持
+
     def _parse_med_list(self, html: str) -> Tuple[List[MedFacility], int]:
         soup = BeautifulSoup(html, "html.parser")
         results: List[MedFacility] = []
@@ -492,7 +524,10 @@ class MHLWScraper:
         m = re.search(r"(\d{1,6})\s*件", soup.get_text())
         if m:
             total = int(m.group(1))
-        for item in soup.find_all("div", class_="item"):
+        items = soup.find_all("div", class_="item")
+        if not MHLWScraper.first_item_text and items:
+            MHLWScraper.first_item_text = items[0].get_text(separator="|", strip=True)[:500]
+        for item in items:
             h3 = item.find("h3", class_="name")
             if not h3:
                 continue
@@ -502,22 +537,17 @@ class MHLWScraper:
             name = link.get_text(strip=True)
             if not name:
                 continue
-            # item全体のテキストから住所を抽出（<p>タグ依存を廃止）
-            raw_text = item.get_text(separator="", strip=True)  # separator=""で余分なスペースを防ぐ
+            # 住所: <p>タグに「〒XXXXXX 住所Googleマップで見る」形式（medical_finder.pyと同じアプローチ）
             address = ""
-            # 〒XXXX-XXXX の後ろに続く住所を取得
-            addr_m = re.search(r"〒\s*[\d-]+\s*(.+?)(?:Googleマップ|Tel|TEL|電話|\d{2,4}[-−]\d{2,4}[-−]\d{4}|$)", raw_text)
-            if addr_m:
-                address = re.sub(r"\s+", "", addr_m.group(1)).strip()[:80]
-            else:
-                # 都道府県名から始まる住所パターン（改行・タグ境界スペースを除去済み）
-                pref_m = re.search(
-                    r"((?:北海道|東京都|大阪府|京都府|[^\s]{2,3}[都道府県])"
-                    r".{4,60}?(?:市|区|町|村).{1,30}?\d[\d-]+)",
-                    raw_text,
-                )
-                if pref_m:
-                    address = pref_m.group(1)[:80]
+            for p_tag in item.find_all("p"):
+                raw = p_tag.get_text(" ", strip=True)
+                if "〒" in raw or re.search(r"[都道府県市区町村]", raw):
+                    cleaned = re.sub(r"〒\s*\d{3}[-－]\d{4}", "", raw)
+                    cleaned = re.sub(r"Googleマップで見る", "", cleaned)
+                    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                    if cleaned:
+                        address = cleaned[:120]
+                        break
             results.append(MedFacility(name=name, address=address, source="mhlw"))
         return results, max(total, len(results))
 
@@ -738,29 +768,28 @@ def run_search(
         center_lat, center_lon, radius_m=med_radius, max_pages=5
     )
     log.append(f"🏥 {med_msg}")
+    if scraper.first_item_text:
+        log.append(f"🔬 HTMLサンプル(1件目): {scraper.first_item_text}")
     med_existing_names = [f.name for f in med_osm]
     geocode_ok, geocode_fail, geocode_skip = 0, 0, 0
-    # 住所が空の場合のフォールバック用: 住所の都道府県を中心住所から推定
-    pref_hint = re.search(r"(?:北海道|東京都|大阪府|京都府|[^\s]{2,3}[都道府県])", address)
-    pref_prefix = pref_hint.group(0) if pref_hint else ""
     for i, nmf in enumerate(navvi_meds):
         if any(name_similarity(nmf.name, en) >= 0.65 for en in med_existing_names):
             # OSM既存エントリと重複 → スキップ（OSMの座標を使う）
             continue
-        # 住所 → 失敗時は施設名+都道府県 の順でジオコーディング
+        # ① 住所でGSI/Nominatim → ② 失敗時のみNominatim名前検索（GSI施設名検索は誤geocoding）
         gc = None
         if nmf.address:
             gc = _geocoder.geocode(nmf.address)
             time.sleep(0.15)
-        if gc is None and pref_prefix:
-            # 住所なし or 住所geocoding失敗 → 施設名+都道府県でリトライ
-            gc = _geocoder.geocode(f"{pref_prefix}{nmf.name}")
+        if gc is None:
+            # 住所なし or 住所geocoding失敗 → Nominatimの施設名+バウンディングボックス検索
+            gc = _geocoder.geocode_by_name(nmf.name, center_lat, center_lon)
             time.sleep(0.15)
         if gc:
             nmf.lat, nmf.lon = gc
             nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
             geocode_ok += 1
-        elif nmf.address or pref_prefix:
+        elif nmf.address:
             geocode_fail += 1
         else:
             geocode_skip += 1
@@ -772,6 +801,9 @@ def run_search(
         f"成功={geocode_ok}件 失敗={geocode_fail}件 住所なし={geocode_skip}件"
         f"  合計（座標あり）: {sum(1 for f in med_osm if f.lat is not None)}件"
     )
+    # 診断: 最初の5件の施設名・住所・座標を出力
+    for dbg in navvi_meds[:5]:
+        log.append(f"  🔬 {dbg.name[:25]} | addr={dbg.address[:40] if dbg.address else '(空)'} | lat={dbg.lat}")
 
     # Step5: 薬局詳細取得（処方箋数）
     ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd][:max_detail]
