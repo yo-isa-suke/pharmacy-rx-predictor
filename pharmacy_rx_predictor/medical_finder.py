@@ -498,12 +498,16 @@ def _parse_osm_pharmacy_elements(
 
 
 def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List["PharmacyFacility"]:
-    """OSM Overpass API で中心点から半径圏内の薬局を取得。"""
+    """OSM Overpass API で中心点から半径圏内の薬局を取得。
+    amenity=pharmacy（専用調剤薬局）とshop=chemist（ドラッグストア）の両方を取得。
+    """
     query = f"""
-[out:json][timeout:40];
+[out:json][timeout:50];
 (
   node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
   way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+  node["shop"="chemist"](around:{radius_m},{lat},{lon});
+  way["shop"="chemist"](around:{radius_m},{lat},{lon});
 );
 out center;
 """
@@ -532,9 +536,11 @@ def search_osm_pharmacies_near_clinics(
     around_nodes = "\n".join(
         f'  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});'
         f'\n  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});'
+        f'\n  node["shop"="chemist"](around:{radius_m},{lat},{lon});'
+        f'\n  way["shop"="chemist"](around:{radius_m},{lat},{lon});'
         for lat, lon in clinic_coords
     )
-    query = f"""[out:json][timeout:60];
+    query = f"""[out:json][timeout:90];
 (
 {around_nodes}
 );
@@ -738,43 +744,63 @@ class MHLWScraper:
         center_name: str = "",
         max_pages: int = 8,
     ) -> Tuple[List[PharmacyFacility], str]:
-        """ナビィで薬局（kikanKbn=5）を緯度経度検索する。"""
+        """ナビィ薬局タブ（S2300/yakkyokuSearch）で薬局を緯度経度検索する。
+
+        旧S2320 medicalCare=["5"] は薬局カテゴリを受け付けないため、
+        薬局専用タブ（S2300/initializeYakk → yakkyokuSearch）を使う。
+        """
         if not self._init():
             return [], "MHLW接続エラー"
         dist_code = "00" if radius_m <= 1_000 else ("01" if radius_m <= 5_000 else "")
+        cn = urllib.parse.quote(center_name or "検索地点")
         try:
-            self.session.get(f"{MHLW_BASE}/juminkanja/S2320/initsearch", timeout=12)
-            # 薬局はmedicalCare=["5"]、searchTypesは医療機関と同じ形式
-            # "01-2"は 01=現在, 2=距離 を意味するため薬局でも共通
-            r2 = self.session.get(
-                f"{MHLW_BASE}/juminkanja/S2320/search",
+            self.session.get(f"{MHLW_BASE}/juminkanja/S2300/initializeYakk", timeout=12)
+            # Step1: 初回リクエスト → 検索ID取得
+            r1 = self.session.get(
+                f"{MHLW_BASE}/juminkanja/S2300/yakkyokuSearch",
                 params={
-                    "specifyDateAndTime": "01",
-                    "centerPointName": urllib.parse.quote(center_name or "検索地点"),
+                    "iyakuKbn": "2",        # 薬局
+                    "lang": "ja",
                     "latitude": str(lat),
                     "longitude": str(lon),
-                    "selectCenterPoint": "",
                     "distanceFromCenterPoint": dist_code,
-                    "medicalCare": ["5"],
-                    "searchTypes": "01-2",
-                    "kikanKbn": "5",          # 薬局を明示
+                    "centerPointName": cn,
+                    "selectCenterPoint": "3",
+                    "specifyDateAndTime": "01",
+                    "XCHARSET": "utf-8",
                 },
                 timeout=15,
             )
-            j = r2.json()
+            j = r1.json()
             if j.get("code") != "0":
-                return [], f"薬局ナビィエラー(無視): {j.get('messages')}"
-            redirect_url = j["result"]["redirectUrl"]
+                return [], f"薬局ナビィエラー(Step1): {j.get('messages')}"
+            search_id = j["result"]["id"]
+            # Step2: 位置情報を紐付け
+            self.session.get(
+                f"{MHLW_BASE}/juminkanja/S2300/yakkyokuSearch",
+                params={
+                    "id": search_id,
+                    "latitude": str(lat),
+                    "longitude": str(lon),
+                    "distanceFromCenterPoint": dist_code,
+                    "selectCenterPoint": "3",
+                    "specifyDateAndTime": "01",
+                    "XCHARSET": "utf-8",
+                },
+                timeout=15,
+            )
         except Exception as e:
-            return [], f"薬局ナビィ例外(無視): {e}"
+            return [], f"薬局ナビィ例外: {e}"
 
         all_ph: List[PharmacyFacility] = []
         total = 0
         for page in range(max_pages):
             try:
-                sep = "&" if "?" in redirect_url else "?"
                 r3 = self.session.get(
-                    f"{redirect_url}{sep}page={page}&size=20&sortNo=2", timeout=15)
+                    f"{MHLW_BASE}/juminkanja/S2400/initialize",
+                    params={"id": search_id, "page": page, "size": 20, "sortNo": 2},
+                    timeout=15,
+                )
                 if r3.status_code != 200:
                     break
                 phs, t = self._parse_pharmacy_list(r3.text)
@@ -800,7 +826,7 @@ class MHLWScraper:
         m = re.search(r"(\d{1,6})\s*件", soup.get_text())
         if m:
             total = int(m.group(1))
-        for item in soup.find_all("div", class_="item"):
+        for item in soup.select("div.resultItems div.item"):
             h3 = item.find("h3", class_="name")
             if not h3:
                 continue
@@ -815,8 +841,10 @@ class MHLWScraper:
             kikan_cd = re.search(r"kikanCd=(\w+)", href)
             pref_cd = pref_cd.group(1) if pref_cd else ""
             kikan_cd = kikan_cd.group(1) if kikan_cd else ""
-            addr_tag = item.find("p", class_=re.compile(r"address|addr"))
-            address = addr_tag.get_text(strip=True) if addr_tag else ""
+            # アドレス: 〒xxx 住所Googleマップで見る → 住所のみ抽出
+            raw_text = item.get_text(separator=" ", strip=True)
+            addr_m = re.search(r"〒\s*[\d-]+\s+(.+?)(?:Googleマップ|$)", raw_text)
+            address = addr_m.group(1).strip() if addr_m else ""
             results.append(PharmacyFacility(
                 name=name, address=address, href=href,
                 pref_cd=pref_cd, kikan_cd=kikan_cd, source="mhlw",
@@ -1847,7 +1875,8 @@ if run_btn and address_input.strip():
 
         # ── Pass2: 各医療機関周辺をクリニックごとに一括OSM検索 ──────────
         # threshold+バッファ（最低200m）で各クリニックを囲むクエリを1回で実行
-        gate_r = max(int(pharmacy_gate_m) + 100, 200)
+        # 門前判定閾値より広めに検索（地方部でも確実に拾うため最低500m）
+        gate_r = max(int(pharmacy_gate_m) * 3, 500)
         time.sleep(2)
         prog.progress(99, text=f"💊 各医療機関周辺({gate_r}m)の薬局を追加取得中…")
         try:
@@ -1866,6 +1895,36 @@ if run_btn and address_input.strip():
             )
         except Exception as e:
             log.append(f"💊 Pass2エラー: {e}")
+
+        ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
+        log.append(f"💊 薬局合計(OSM): {len(ph_merged)}件")
+
+        # ── Pass3: ナビィ薬局リスト検索（OSMにない門前薬局を補完）──────────
+        # OSMは地方部の調剤薬局登録が疎なため、厚労省ナビィから追加取得する
+        time.sleep(2)
+        prog.progress(99, text="💊 ナビィ薬局リストを取得中…")
+        try:
+            navvi_phs, navvi_msg = scraper.search_pharmacies_by_latlon(
+                center_lat, center_lon, radius_m=radius_m, center_name="検索地点", max_pages=5
+            )
+            log.append(f"💊 Pass3（ナビィ薬局）: {navvi_msg}")
+            added_navvi = 0
+            existing_names = [p.name for p in ph_merged]
+            for navvi_ph in navvi_phs:
+                if any(name_similarity(navvi_ph.name, en) >= 0.65 for en in existing_names):
+                    continue
+                # 住所をジオコーディングして座標を付与
+                if navvi_ph.address:
+                    gc = _geocoder.geocode(navvi_ph.address)
+                    if gc:
+                        navvi_ph.lat, navvi_ph.lon = gc
+                        navvi_ph.distance_m = haversine(center_lat, center_lon, navvi_ph.lat, navvi_ph.lon)
+                ph_merged.append(navvi_ph)
+                existing_names.append(navvi_ph.name)
+                added_navvi += 1
+            log.append(f"💊 Pass3追加: {added_navvi}件（ナビィ固有薬局）")
+        except Exception as e:
+            log.append(f"💊 Pass3エラー: {e}")
 
         ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
         log.append(f"💊 薬局合計: {len(ph_merged)}件")
