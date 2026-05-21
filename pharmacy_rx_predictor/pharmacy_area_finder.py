@@ -500,8 +500,18 @@ class MHLWScraper:
             if not link:
                 continue
             name = link.get_text(strip=True)
-            if name:
-                results.append(MedFacility(name=name, source="mhlw"))
+            if not name:
+                continue
+            # 住所を抽出（ジオコーディングで座標付与するために必要）
+            address = ""
+            for p_tag in item.find_all("p"):
+                raw = p_tag.get_text(" ", strip=True)
+                if "〒" in raw or re.search(r"[都道府県市区町村]", raw):
+                    cleaned = re.sub(r"〒\s*\d{3}[-－]\d{4}", "", raw)
+                    cleaned = re.sub(r"Googleマップで見る", "", cleaned)
+                    address = re.sub(r"\s+", " ", cleaned).strip()[:120]
+                    break
+            results.append(MedFacility(name=name, address=address, source="mhlw"))
         return results, max(total, len(results))
 
     def get_pharmacy_detail(self, ph: PharmacyFacility) -> bool:
@@ -703,23 +713,38 @@ def run_search(
 
     # Step4: OSM 医療機関検索（門前判定用）
     prog.progress(55, text="🏥 医療機関（門前判定用）を取得中…")
-    med_radius = max(gate_m + 200, 500)
+    med_radius = radius_m + gate_m
     time.sleep(2)
     med_osm = search_osm_medical(center_lat, center_lon, med_radius)
     log.append(f"🏥 OSM医療機関: {med_radius}m圏内 {len(med_osm)}件")
 
-    # ナビィ医療機関も補完（座標をジオコーディング）
+    # ナビィ医療機関を取得してジオコーディングで座標付与（OSMの疎な地方部をカバー）
     prog.progress(60, text="🏥 ナビィ医療機関リストを取得中…")
     navvi_meds, med_msg = scraper.search_medical_by_latlon(
-        center_lat, center_lon, radius_m=med_radius, max_pages=3
+        center_lat, center_lon, radius_m=med_radius, max_pages=5
     )
     log.append(f"🏥 {med_msg}")
     med_existing_names = [f.name for f in med_osm]
-    for nmf in navvi_meds:
+    geocode_ok, geocode_fail = 0, 0
+    for i, nmf in enumerate(navvi_meds):
         if any(name_similarity(nmf.name, en) >= 0.65 for en in med_existing_names):
+            # OSM既存エントリと重複 → スキップ（OSMの座標を使う）
             continue
+        # 住所からジオコーディングして座標を付与
+        if nmf.address:
+            gc = _geocoder.geocode(nmf.address)
+            if gc:
+                nmf.lat, nmf.lon = gc
+                nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
+                geocode_ok += 1
+            else:
+                geocode_fail += 1
         med_osm.append(nmf)
         med_existing_names.append(nmf.name)
+    log.append(
+        f"🏥 ナビィ医療機関ジオコーディング: 成功={geocode_ok}件 失敗={geocode_fail}件"
+        f"  合計（座標あり）: {sum(1 for f in med_osm if f.lat is not None)}件"
+    )
 
     # Step5: 薬局詳細取得（処方箋数）
     ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd][:max_detail]
