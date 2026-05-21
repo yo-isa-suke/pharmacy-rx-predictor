@@ -503,21 +503,21 @@ class MHLWScraper:
             if not name:
                 continue
             # item全体のテキストから住所を抽出（<p>タグ依存を廃止）
-            raw_text = item.get_text(separator=" ", strip=True)
+            raw_text = item.get_text(separator="", strip=True)  # separator=""で余分なスペースを防ぐ
             address = ""
             # 〒XXXX-XXXX の後ろに続く住所を取得
-            addr_m = re.search(r"〒\s*[\d-]+\s+(.+?)(?:Googleマップ|$)", raw_text)
+            addr_m = re.search(r"〒\s*[\d-]+\s*(.+?)(?:Googleマップ|Tel|TEL|電話|\d{2,4}[-−]\d{2,4}[-−]\d{4}|$)", raw_text)
             if addr_m:
-                address = re.sub(r"\s+", " ", addr_m.group(1)).strip()[:120]
+                address = re.sub(r"\s+", "", addr_m.group(1)).strip()[:80]
             else:
-                # 都道府県名から始まる住所パターン
+                # 都道府県名から始まる住所パターン（改行・タグ境界スペースを除去済み）
                 pref_m = re.search(
                     r"((?:北海道|東京都|大阪府|京都府|[^\s]{2,3}[都道府県])"
-                    r"[^\s]*(?:市|区|町|村)[^\s]*)",
+                    r".{4,60}?(?:市|区|町|村).{1,30}?\d[\d-]+)",
                     raw_text,
                 )
                 if pref_m:
-                    address = pref_m.group(1)[:120]
+                    address = pref_m.group(1)[:80]
             results.append(MedFacility(name=name, address=address, source="mhlw"))
         return results, max(total, len(results))
 
@@ -747,17 +747,21 @@ def run_search(
         if any(name_similarity(nmf.name, en) >= 0.65 for en in med_existing_names):
             # OSM既存エントリと重複 → スキップ（OSMの座標を使う）
             continue
-        # 住所からジオコーディングして座標を付与
-        geocode_query = nmf.address or (f"{pref_prefix}{nmf.name}" if pref_prefix else "")
-        if geocode_query:
-            gc = _geocoder.geocode(geocode_query)
-            if gc:
-                nmf.lat, nmf.lon = gc
-                nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
-                geocode_ok += 1
-            else:
-                geocode_fail += 1
-            time.sleep(0.15)  # GSIレート制限対策
+        # 住所 → 失敗時は施設名+都道府県 の順でジオコーディング
+        gc = None
+        if nmf.address:
+            gc = _geocoder.geocode(nmf.address)
+            time.sleep(0.15)
+        if gc is None and pref_prefix:
+            # 住所なし or 住所geocoding失敗 → 施設名+都道府県でリトライ
+            gc = _geocoder.geocode(f"{pref_prefix}{nmf.name}")
+            time.sleep(0.15)
+        if gc:
+            nmf.lat, nmf.lon = gc
+            nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
+            geocode_ok += 1
+        elif nmf.address or pref_prefix:
+            geocode_fail += 1
         else:
             geocode_skip += 1
         med_osm.append(nmf)
