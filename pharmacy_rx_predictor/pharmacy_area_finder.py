@@ -77,6 +77,9 @@ class MedFacility:
     lon: Optional[float] = None
     distance_m: Optional[float] = None
     source: str = "osm"
+    pref_cd: str = ""
+    kikan_cd: str = ""
+    kikan_kbn: int = 2
 
 
 # ─── ユーティリティ ────────────────────────────────────────────────────────────
@@ -516,6 +519,8 @@ class MHLWScraper:
         return all_facs, f"MHLW医療機関: {dist_str}圏内 全{total}件/取得{len(all_facs)}件"
 
     def _parse_med_list(self, html: str) -> Tuple[List[MedFacility], int]:
+        """S2400 医療機関一覧HTMLからMedFacilityリストを生成する。
+        住所はここでは取得せず、詳細ページ（S2430）で取得するため pref_cd/kikan_cd を抽出する。"""
         soup = BeautifulSoup(html, "html.parser")
         results: List[MedFacility] = []
         total = 0
@@ -532,19 +537,54 @@ class MHLWScraper:
             name = link.get_text(strip=True)
             if not name:
                 continue
-            # 住所: <p>タグに「〒XXXXXX 住所Googleマップで見る」形式（medical_finder.pyと同じアプローチ）
-            address = ""
-            for p_tag in item.find_all("p"):
-                raw = p_tag.get_text(" ", strip=True)
-                if "〒" in raw or re.search(r"[都道府県市区町村]", raw):
-                    cleaned = re.sub(r"〒\s*\d{3}[-－]\d{4}", "", raw)
-                    cleaned = re.sub(r"Googleマップで見る", "", cleaned)
-                    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                    if cleaned:
-                        address = cleaned[:120]
-                        break
-            results.append(MedFacility(name=name, address=address, source="mhlw"))
+            href = link.get("href", "")
+            if href.startswith("/"):
+                href = MHLW_DOMAIN + href
+            qp = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(href).query))
+            pref_cd   = qp.get("prefCd", "")
+            kikan_cd  = qp.get("kikanCd", "")
+            kikan_kbn = int(qp.get("kikanKbn", "2"))
+            results.append(MedFacility(
+                name=name, source="mhlw",
+                pref_cd=pref_cd, kikan_cd=kikan_cd, kikan_kbn=kikan_kbn,
+            ))
         return results, max(total, len(results))
+
+    def get_medical_address(self, pref_cd: str, kikan_cd: str, kikan_kbn: int = 2) -> str:
+        """ナビィ医療機関詳細ページ（S2430）から住所を取得する。
+        薬局と同じエンドポイントで kikanKbn だけ異なる（1=病院, 2=診療所）。"""
+        if not (pref_cd and kikan_cd):
+            return ""
+        url = (f"{MHLW_BASE}/juminkanja/S2430/initialize"
+               f"?prefCd={pref_cd}&kikanCd={kikan_cd}&kikanKbn={kikan_kbn}")
+        try:
+            r = self.session.get(url, timeout=12)
+            if r.status_code != 200:
+                return ""
+            soup = BeautifulSoup(r.text, "html.parser")
+            text = soup.get_text(separator="\n", strip=True)
+            if "E-0109" in text or "データは存在しません" in text:
+                return ""
+            # テーブルのth/tdから「所在地」「住所」を探す
+            for row in soup.find_all("tr"):
+                cells = row.find_all(["th", "td"])
+                if len(cells) >= 2:
+                    key = cells[0].get_text(strip=True)
+                    if re.search(r"所在地|住所", key):
+                        val = cells[1].get_text(" ", strip=True)
+                        val = re.sub(r"〒\s*\d{3}[-－]\d{4}\s*", "", val).strip()
+                        val = re.sub(r"\s+", " ", val).strip()
+                        if val:
+                            return val[:120]
+            # フォールバック: ページ全体から〒パターン
+            m = re.search(r"〒\s*[\d-]+\s+(.+?)(?:Tel|TEL|電話|Googleマップ|\n|$)", text)
+            if m:
+                addr = re.sub(r"\s+", " ", m.group(1)).strip()
+                if addr:
+                    return addr[:120]
+        except Exception:
+            pass
+        return ""
 
     def get_pharmacy_detail(self, ph: PharmacyFacility) -> bool:
         """ナビィ薬局詳細ページから総取扱処方箋数を取得する。"""
@@ -757,41 +797,46 @@ def run_search(
     if len(med_osm) == 0:
         log.append("⚠️ OSM医療機関が0件 → ナビィ医療機関のみで判定します")
 
-    # ナビィ医療機関を取得してジオコーディングで座標付与（OSMの疎な地方部をカバー）
+    # ナビィ医療機関を取得 → 詳細ページ（S2430）から住所取得 → ジオコーディング
     prog.progress(60, text="🏥 ナビィ医療機関リストを取得中…")
     navvi_meds, med_msg = scraper.search_medical_by_latlon(
         center_lat, center_lon, radius_m=med_radius, max_pages=5
     )
     log.append(f"🏥 {med_msg}")
+
     med_existing_names = [f.name for f in med_osm]
-    geocode_ok, geocode_fail, geocode_skip = 0, 0, 0
-    for i, nmf in enumerate(navvi_meds):
-        if any(name_similarity(nmf.name, en) >= 0.65 for en in med_existing_names):
-            # OSM既存エントリと重複 → スキップ（OSMの座標を使う）
-            continue
-        # ① 住所でGSI/Nominatim → ② 失敗時のみNominatim名前検索（GSI施設名検索は誤geocoding）
-        gc = None
-        if nmf.address:
-            gc = _geocoder.geocode(nmf.address)
-            time.sleep(0.15)
-        if gc is None:
-            # 住所なし or 住所geocoding失敗 → Nominatimの施設名+バウンディングボックス検索
-            gc = _geocoder.geocode_by_name(nmf.name, center_lat, center_lon)
-            time.sleep(0.15)
-        if gc:
-            nmf.lat, nmf.lon = gc
-            nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
-            geocode_ok += 1
-        elif nmf.address:
-            geocode_fail += 1
+    # 中心から近い順に最大50件の詳細ページを取得（門前判定に十分な範囲をカバー）
+    med_targets = [
+        f for f in navvi_meds
+        if f.pref_cd and f.kikan_cd
+        and not any(name_similarity(f.name, en) >= 0.65 for en in med_existing_names)
+    ][:50]
+    geocode_ok, geocode_fail, addr_fail = 0, 0, 0
+    for i, nmf in enumerate(med_targets):
+        prog.progress(
+            62 + int(13 * i / max(len(med_targets), 1)),
+            text=f"🏥 医療機関住所取得中 {i+1}/{len(med_targets)}件…",
+        )
+        # S2430 詳細ページから住所を取得（最も確実な方法）
+        addr = scraper.get_medical_address(nmf.pref_cd, nmf.kikan_cd, nmf.kikan_kbn)
+        if addr:
+            nmf.address = addr
+            gc = _geocoder.geocode(addr)
+            if gc:
+                nmf.lat, nmf.lon = gc
+                nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
+                geocode_ok += 1
+            else:
+                geocode_fail += 1
         else:
-            geocode_skip += 1
+            addr_fail += 1
         med_osm.append(nmf)
         med_existing_names.append(nmf.name)
-    n_with_addr = sum(1 for f in navvi_meds if f.address)
+        time.sleep(0.2)
+
     log.append(
-        f"🏥 ナビィ医療機関ジオコーディング: 住所あり={n_with_addr}件 "
-        f"成功={geocode_ok}件 失敗={geocode_fail}件 住所なし={geocode_skip}件"
+        f"🏥 医療機関住所取得: 成功={geocode_ok}件（座標確定）"
+        f" / 住所取得失敗={addr_fail}件 / geocoding失敗={geocode_fail}件"
         f"  合計（座標あり）: {sum(1 for f in med_osm if f.lat is not None)}件"
     )
 
@@ -800,8 +845,8 @@ def run_search(
     log.append(f"💊 ナビィ詳細取得対象: {len(ph_targets)}件")
     for i, ph in enumerate(ph_targets):
         prog.progress(
-            65 + int(25 * i / max(len(ph_targets), 1)),
-            text=f"💊 詳細取得中 ({i+1}/{len(ph_targets)}): {ph.name[:20]}…",
+            77 + int(15 * i / max(len(ph_targets), 1)),
+            text=f"💊 処方箋数取得中 ({i+1}/{len(ph_targets)}): {ph.name[:20]}…",
         )
         scraper.get_pharmacy_detail(ph)
         time.sleep(0.5)
