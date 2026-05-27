@@ -218,11 +218,16 @@ def search_osm_medical(lat: float, lon: float, radius_m: int) -> List[MedFacilit
 (
   node["amenity"~"^(clinic|hospital|doctors|medical_centre)$"](around:{radius_m},{lat},{lon});
   way["amenity"~"^(clinic|hospital|doctors|medical_centre)$"](around:{radius_m},{lat},{lon});
-  node["healthcare"](around:{radius_m},{lat},{lon});
-  way["healthcare"](around:{radius_m},{lat},{lon});
+  node["healthcare"]["healthcare"!~"^(pharmacy|chemist|dispensary|yes)$"](around:{radius_m},{lat},{lon});
+  way["healthcare"]["healthcare"!~"^(pharmacy|chemist|dispensary|yes)$"](around:{radius_m},{lat},{lon});
 );
 out center;
 """
+    # 薬局キーワードフィルター（名前ベース）
+    _PHARMA_RE = re.compile(
+        r'薬局|ドラッグ|ファーマ|調剤|くすり|クスリ|drug\s*store|pharmacy', re.IGNORECASE
+    )
+
     data = _overpass_post(query)
     if not data:
         return []
@@ -231,6 +236,9 @@ out center;
         tags = el.get("tags", {})
         name = tags.get("name:ja") or tags.get("name", "")
         if not name:
+            continue
+        # 薬局・ドラッグストアを除外
+        if _PHARMA_RE.search(name):
             continue
         if el["type"] == "node":
             f_lat, f_lon = el.get("lat"), el.get("lon")
@@ -1248,11 +1256,17 @@ def run_analysis(
     )
     log.append(f"[Step5] {med_msg}")
 
+    # 薬局名フィルター（ナビィ医療機関検索に薬局が混入する場合を除外）
+    _PHARMA_NAME_RE = re.compile(
+        r'薬局|ドラッグ|ファーマ|調剤|くすり|クスリ|drug\s*store|pharmacy', re.IGNORECASE
+    )
     med_existing_names = [f.name for f in med_osm]
     med_existing_kikan_cds = {f.kikan_cd for f in med_osm if f.kikan_cd}
     med_targets = [
         f for f in navvi_meds
         if f.pref_cd and f.kikan_cd
+        and f.kikan_kbn != 5                          # kikanKbn=5は薬局
+        and not _PHARMA_NAME_RE.search(f.name)        # 名前ベースでも除外
         and f.kikan_cd not in med_existing_kikan_cds
         and not any(name_similarity(f.name, en) >= 0.65 for en in med_existing_names)
     ][:50]
@@ -1541,13 +1555,14 @@ if st.session_state.med_results or st.session_state.ph_results:
         for fac in med_facs:
             rows.append({
                 "施設名":      fac.name,
-                "距離(m)":     int(fac.distance_m) if fac.distance_m else None,
+                "距離(m)":     int(fac.distance_m) if fac.distance_m is not None else None,
                 "種別":        fac.facility_category,
                 "院内外処方":  fac.rx_summary,
-                "外来患者数":  fac.daily_outpatients,
-                "週診療日数":  fac.weekly_op_days,
+                "外来患者数":  f"{fac.daily_outpatients:,} 人/日" if fac.daily_outpatients else "なし",
+                "週診療日数":  f"{fac.weekly_op_days:.1f} 日" if fac.weekly_op_days else "なし",
                 "診療科":      fac.specialties or "—",
                 "住所":        fac.address or "—",
+                "ナビィURL":   fac.detail_url or "",
             })
         df_med = pd.DataFrame(rows)
         st.dataframe(
@@ -1555,9 +1570,8 @@ if st.session_state.med_results or st.session_state.ph_results:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "距離(m)":    st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
-                "外来患者数": st.column_config.NumberColumn("外来患者数", format="%d 人/日", width="small"),
-                "週診療日数": st.column_config.NumberColumn("週診療日数", format="%.1f 日", width="small"),
+                "距離(m)":   st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
+                "ナビィURL":  st.column_config.LinkColumn("ナビィURL", display_text="🔗 ナビィ", width="small"),
             },
         )
         csv_med = pd.DataFrame([{
@@ -1601,12 +1615,13 @@ if st.session_state.med_results or st.session_state.ph_results:
         for ph in pharmacies:
             rows_ph.append({
                 "薬局名":        ph.name,
-                "距離(m)":       int(ph.distance_m) if ph.distance_m else None,
+                "距離(m)":       int(ph.distance_m) if ph.distance_m is not None else None,
                 "種別":          ph.pharmacy_type,
                 "最近接医療機関": ph.nearest_clinic_name,
-                "最近接距離(m)": int(ph.nearest_clinic_dist_m) if ph.nearest_clinic_dist_m else None,
+                "最近接距離(m)": int(ph.nearest_clinic_dist_m) if ph.nearest_clinic_dist_m is not None else None,
                 "年間処方箋数":  ph.annual_rx_count,
                 "住所":          ph.address or "—",
+                "ナビィURL":     ph.href or "",
             })
         df_ph = pd.DataFrame(rows_ph)
         st.dataframe(
@@ -1617,6 +1632,7 @@ if st.session_state.med_results or st.session_state.ph_results:
                 "距離(m)":      st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
                 "最近接距離(m)": st.column_config.NumberColumn("最近接距離", format="%d m", width="small"),
                 "年間処方箋数":  st.column_config.NumberColumn("年間処方箋数", format="%d 枚", width="small"),
+                "ナビィURL":     st.column_config.LinkColumn("ナビィURL", display_text="🔗 ナビィ", width="small"),
             },
         )
         csv_ph = pd.DataFrame([{
