@@ -1,5 +1,5 @@
 /* お弁当日記 — オフラインでも開けるようにするための Service Worker */
-const CACHE = "bento-diary-v1";
+const CACHE = "bento-diary-v2";
 const ASSETS = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "icon-180.png"];
 
 self.addEventListener("install", (event) => {

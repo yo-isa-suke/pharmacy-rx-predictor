@@ -106,10 +106,13 @@
   /* ---- 出力 ---- */
   .exportRow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .exportRow button { flex: 1 1 45%; }
-  input[type="text"] {
+  input[type="text"], input[type="month"] {
     width: 100%; border: 1px solid var(--line); border-radius: 10px;
     padding: 10px 12px; font-size: 1rem; font-family: inherit; background: #fffdfb; color: var(--text);
   }
+  .segmented { display: flex; gap: 4px; background: var(--accent-soft); border-radius: 12px; padding: 4px; }
+  .segmented button { flex: 1; padding: 9px 0; font-size: .88rem; border-radius: 9px; background: none; color: var(--accent); }
+  .segmented button.active { background: var(--accent); color: #fff; font-weight: 600; }
   .note { font-size: .78rem; color: var(--muted); margin-top: 8px; }
   #importInput { display: none; }
 
@@ -175,16 +178,28 @@
   <section id="view-export" class="view">
     <div class="card">
       <h2>🎁 アルバムを作る(プレゼント用)</h2>
-      <label class="fieldLabel" for="albumTitle">アルバムのタイトル</label>
-      <input type="text" id="albumTitle" value="毎日のお弁当、ありがとう">
-      <label class="fieldLabel" for="albumMessage">表紙に入れるメッセージ</label>
-      <textarea id="albumMessage" placeholder="例:1年間、毎朝お弁当を作ってくれてありがとう。全部おいしかった!"></textarea>
-      <label class="fieldLabel">対象期間(空欄なら全期間)</label>
-      <div style="display:flex; gap:8px; align-items:center;">
-        <input type="date" id="rangeFrom"> 〜 <input type="date" id="rangeTo">
+      <label class="fieldLabel">出力する範囲</label>
+      <div class="segmented" id="modeSeg">
+        <button data-mode="month" class="active">1ヶ月分</button>
+        <button data-mode="range">期間指定</button>
+        <button data-mode="all">全期間</button>
       </div>
-      <button class="btnPrimary" id="albumBtn">アルバム(HTML)を書き出す</button>
-      <p class="note">写真入りの1つのファイルとして保存されます。スマホやPCのブラウザで開いてそのまま見せられます。開いた画面から「印刷 → PDFとして保存」で冊子印刷用のPDFにもできます。</p>
+      <div id="modeMonth">
+        <label class="fieldLabel" for="monthInput">月を選ぶ</label>
+        <input type="month" id="monthInput">
+      </div>
+      <div id="modeRange" hidden>
+        <label class="fieldLabel">期間</label>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input type="date" id="rangeFrom"> 〜 <input type="date" id="rangeTo">
+        </div>
+      </div>
+      <label class="fieldLabel" for="albumTitle">タイトル(空欄なら「2026年7月のお弁当」のように自動)</label>
+      <input type="text" id="albumTitle" placeholder="例:今月のお弁当、ありがとう">
+      <label class="fieldLabel" for="albumMessage">とびらページのメッセージ</label>
+      <textarea id="albumMessage" placeholder="例:今月もおいしいお弁当をありがとう。唐揚げの日が最高でした!"></textarea>
+      <button class="btnPrimary" id="albumBtn">アルバムを書き出す</button>
+      <p class="note">「表紙 → 写真入りカレンダー → 1日ごとの記録ページ」の冊子風アルバムが1つのファイルとして保存されます。ブラウザで開いてそのまま見せられるほか、開いた画面から「印刷 → PDFとして保存」すれば印刷してプレゼントにもできます。</p>
     </div>
 
     <div class="card">
@@ -448,35 +463,110 @@ async function updateStreak() {
 }
 
 /* ---------- アルバム出力 ---------- */
+let exportMode = "month";
+const modeSeg = document.getElementById("modeSeg");
+modeSeg.querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+  exportMode = b.dataset.mode;
+  modeSeg.querySelectorAll("button").forEach(x => x.classList.toggle("active", x === b));
+  document.getElementById("modeMonth").hidden = exportMode !== "month";
+  document.getElementById("modeRange").hidden = exportMode !== "range";
+}));
+document.getElementById("monthInput").value = todayStr().slice(0, 7);
+
+/* カレンダー用の正方形サムネイルを作る */
+function makeThumb(blob, size = 240, quality = 0.7) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const side = Math.min(img.width, img.height);
+      const sx = (img.width - side) / 2, sy = (img.height - side) / 2;
+      const canvas = document.createElement("canvas");
+      canvas.width = size; canvas.height = size;
+      canvas.getContext("2d").drawImage(img, sx, sy, side, side, 0, 0, size, size);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("サムネイル作成に失敗しました")); };
+    img.src = url;
+  });
+}
+
+/* 写真入りの月間カレンダーHTMLを組み立てる */
+function buildCalendar(year, month, thumbsByDate) {
+  const firstDow = new Date(year, month - 1, 1).getDay();
+  const daysInMonth = new Date(year, month, 0).getDate();
+  let cells = "";
+  for (let i = 0; i < firstDow; i++) cells += '<div class="cell empty"></div>';
+  for (let d = 1; d <= daysInMonth; d++) {
+    const key = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    const t = thumbsByDate.get(key);
+    cells += `<div class="cell${t ? " has" : ""}">${t ? `<img src="${t}" alt="">` : ""}<span class="num">${d}</span></div>`;
+  }
+  const dow = ["日", "月", "火", "水", "木", "金", "土"]
+    .map((w, i) => `<span class="${i === 0 ? "sun" : i === 6 ? "sat" : ""}">${w}</span>`).join("");
+  return `<section class="calpage">
+<h2 class="calhead"><span class="m">${month}</span><span class="unit">月</span><span class="y">${year}</span></h2>
+<div class="dow">${dow}</div>
+<div class="calgrid">${cells}</div>
+</section>`;
+}
+
 document.getElementById("albumBtn").addEventListener("click", async () => {
   const btn = document.getElementById("albumBtn");
   btn.disabled = true;
   btn.textContent = "作成中…";
   try {
     let entries = await getAllEntries();
-    const from = document.getElementById("rangeFrom").value;
-    const to = document.getElementById("rangeTo").value;
+    let from = "", to = "", autoTitle = "お弁当のきろく", periodLabel = "";
+    if (exportMode === "month") {
+      const m = document.getElementById("monthInput").value;
+      if (!m) { alert("月を選んでください。"); return; }
+      from = m + "-01"; to = m + "-31";
+      const [y, mo] = m.split("-").map(Number);
+      autoTitle = `${y}年${mo}月のお弁当`;
+      periodLabel = `${y}年${mo}月`;
+    } else if (exportMode === "range") {
+      from = document.getElementById("rangeFrom").value;
+      to = document.getElementById("rangeTo").value;
+    }
     if (from) entries = entries.filter(e => e.date >= from);
     if (to) entries = entries.filter(e => e.date <= to);
     if (!entries.length) { alert("この期間に記録がありません。"); return; }
     entries.sort((a, b) => a.date.localeCompare(b.date) || a.createdAt - b.createdAt);
 
-    const title = document.getElementById("albumTitle").value.trim() || "お弁当アルバム";
+    const title = document.getElementById("albumTitle").value.trim() || autoTitle;
     const message = document.getElementById("albumMessage").value.trim();
-    const first = formatDateJa(entries[0].date);
-    const last = formatDateJa(entries[entries.length - 1].date);
+    if (!periodLabel) {
+      periodLabel = `${formatDateJa(entries[0].date)} 〜 ${formatDateJa(entries[entries.length - 1].date)}`;
+    }
     const dayCount = new Set(entries.map(e => e.date)).size;
 
-    const pages = [];
+    /* 月ごとに「カレンダー+記録ページ」を作る */
+    const byMonth = new Map();
     for (const e of entries) {
-      const dataUrl = await blobToDataURL(e.photo);
-      pages.push(
-        `<figure class="page">` +
-        `<img src="${dataUrl}" alt="">` +
-        `<figcaption><div class="d">${formatDateJa(e.date)}</div>` +
-        `<div class="c">${escapeHtml(e.comment)}</div></figcaption>` +
-        `</figure>`
-      );
+      const k = e.date.slice(0, 7);
+      if (!byMonth.has(k)) byMonth.set(k, []);
+      byMonth.get(k).push(e);
+    }
+    const sections = [];
+    for (const [ym, list] of byMonth) {
+      const [yy, mm] = ym.split("-").map(Number);
+      const thumbs = new Map();
+      for (const e of list) {
+        if (!thumbs.has(e.date)) thumbs.set(e.date, await makeThumb(e.photo));
+      }
+      const shots = [];
+      for (const e of list) {
+        const [, m2, d2] = e.date.split("-").map(Number);
+        const wd = WEEKDAYS[new Date(yy, m2 - 1, d2).getDay()];
+        const dataUrl = await blobToDataURL(e.photo);
+        shots.push(`<figure class="shot">
+<div class="photo"><img src="${dataUrl}" alt=""></div>
+<figcaption><div class="d">${m2}月${d2}日(${wd})</div>${e.comment ? `<div class="c">${escapeHtml(e.comment)}</div>` : ""}</figcaption>
+</figure>`);
+      }
+      sections.push(buildCalendar(yy, mm, thumbs) + `\n<div class="shots">${shots.join("\n")}</div>`);
     }
 
     const html = `<!DOCTYPE html>
@@ -487,41 +577,71 @@ document.getElementById("albumBtn").addEventListener("click", async () => {
 <title>${escapeHtml(title)}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Hiragino Mincho ProN", "Noto Serif JP", serif; background: #f7f2ec; color: #3d3630; }
-  .cover { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 40px 24px; }
-  .cover .mark { font-size: 3rem; }
-  .cover h1 { font-size: 1.8rem; margin: 18px 0 10px; letter-spacing: .1em; }
-  .cover .period { color: #94897d; font-size: .9rem; }
-  .cover .msg { margin-top: 28px; max-width: 34em; white-space: pre-wrap; line-height: 2; }
-  .cover .stats { margin-top: 34px; font-size: .95rem; color: #b0500e; }
-  .page { max-width: 640px; margin: 0 auto 48px; padding: 0 16px; }
-  .page img { width: 100%; border-radius: 12px; box-shadow: 0 4px 20px rgba(60,40,20,.12); }
-  .page figcaption { padding: 12px 6px 0; }
-  .page .d { font-size: .85rem; color: #94897d; }
-  .page .c { margin-top: 4px; white-space: pre-wrap; line-height: 1.9; }
-  .fin { text-align: center; padding: 60px 20px 80px; color: #94897d; letter-spacing: .2em; }
+  body { font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif; background: #f6efe6; color: #41382e; }
+  /* --- 表紙 --- */
+  .cover { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 20px; }
+  .cover .frame { width: 100%; max-width: 560px; background: #fffdf8; border: 1px solid #cfae7f; padding: 60px 30px; text-align: center; position: relative; box-shadow: 0 10px 40px rgba(90,60,20,.12); }
+  .cover .frame::before { content: ""; position: absolute; inset: 8px; border: 1px solid #e6d4b6; pointer-events: none; }
+  .cover .mark { font-size: 2.6rem; }
+  .cover h1 { font-size: 1.65rem; letter-spacing: .14em; margin: 20px 0 10px; font-weight: 600; }
+  .cover .period { color: #a08c6d; letter-spacing: .22em; font-size: .82rem; }
+  .cover .msg { margin: 32px auto 0; max-width: 26em; white-space: pre-wrap; line-height: 2.2; font-size: .95rem; }
+  .cover .stats { margin-top: 36px; color: #b0500e; font-size: .82rem; letter-spacing: .12em; }
+  /* --- カレンダー --- */
+  .calpage { max-width: 640px; margin: 64px auto 44px; padding: 0 16px; }
+  .calhead { text-align: center; margin-bottom: 18px; font-weight: 600; }
+  .calhead .m { font-size: 2.5rem; color: #b0500e; }
+  .calhead .unit { font-size: 1rem; margin: 0 8px 0 2px; }
+  .calhead .y { font-size: .85rem; color: #a08c6d; letter-spacing: .18em; }
+  .dow { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: .7rem; color: #a08c6d; margin-bottom: 6px; }
+  .dow .sun { color: #c0605a; } .dow .sat { color: #6a89a8; }
+  .calgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+  .cell { aspect-ratio: 1; border-radius: 8px; background: #fdf8f0; border: 1px solid #eee3d2; position: relative; overflow: hidden; }
+  .cell.empty { background: none; border: none; }
+  .cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cell .num { position: absolute; top: 2px; left: 5px; font-size: .62rem; color: #a08c6d; }
+  .cell.has .num { color: #fff; text-shadow: 0 0 4px rgba(0,0,0,.75); }
+  /* --- 記録ページ(ポラロイド風) --- */
+  .shots { padding: 0 16px; }
+  .shot { background: #fffdf8; border: 1px solid #eadfcc; box-shadow: 0 6px 24px rgba(90,60,20,.10); padding: 14px 14px 18px; margin: 0 auto 40px; max-width: 440px; }
+  .shot .photo img { width: 100%; display: block; }
+  .shot figcaption { padding: 12px 4px 0; }
+  .shot .d { font-size: .78rem; color: #a08c6d; letter-spacing: .12em; }
+  .shot .c { margin-top: 4px; line-height: 2; white-space: pre-wrap; font-size: .95rem; }
+  .fin { text-align: center; padding: 70px 20px 90px; color: #a08c6d; letter-spacing: .3em; line-height: 2.4; }
+  .fin .small { font-size: .78rem; }
+  /* --- 印刷(PDF化)用 --- */
+  @page { size: A4; margin: 12mm; }
   @media print {
     body { background: #fff; }
-    .cover { page-break-after: always; min-height: 90vh; }
-    .page { page-break-inside: avoid; }
+    .cover { min-height: auto; page-break-after: always; }
+    .cover .frame { box-shadow: none; }
+    .calpage { page-break-after: always; margin-top: 10mm; }
+    .shot { break-inside: avoid; box-shadow: none; max-width: 126mm; }
+    .shot .photo img { max-height: 92mm; object-fit: cover; }
+    .fin { page-break-before: always; }
   }
 </style>
 </head>
 <body>
 <div class="cover">
-  <div class="mark">🍱</div>
-  <h1>${escapeHtml(title)}</h1>
-  <div class="period">${first} 〜 ${last}</div>
-  ${message ? `<p class="msg">${escapeHtml(message)}</p>` : ""}
-  <div class="stats">お弁当の記録:${dayCount}日分・${entries.length}枚</div>
+  <div class="frame">
+    <div class="mark">🍱</div>
+    <h1>${escapeHtml(title)}</h1>
+    ${title === autoTitle && exportMode === "month" ? "" : `<div class="period">${periodLabel}</div>`}
+    ${message ? `<p class="msg">${escapeHtml(message)}</p>` : ""}
+    <div class="stats">お弁当の記録 ${dayCount}日分・${entries.length}枚</div>
+  </div>
 </div>
-${pages.join("\n")}
-<div class="fin">ごちそうさまでした。</div>
+${sections.join("\n")}
+<div class="fin">🍱<br>ごちそうさまでした<br><span class="small">${dayCount}日分の、ありがとう。</span></div>
 </body>
 </html>`;
 
     const blob = new Blob([html], { type: "text/html" });
-    const filename = `obento-album-${entries[0].date}_${entries[entries.length - 1].date}.html`;
+    const filename = exportMode === "month"
+      ? `obento-album-${document.getElementById("monthInput").value}.html`
+      : `obento-album-${entries[0].date}_${entries[entries.length - 1].date}.html`;
     if (navigator.canShare && navigator.canShare({ files: [new File([blob], filename, { type: "text/html" })] })) {
       try {
         await navigator.share({ files: [new File([blob], filename, { type: "text/html" })], title });
@@ -534,7 +654,7 @@ ${pages.join("\n")}
     downloadBlob(blob, filename);
   } finally {
     btn.disabled = false;
-    btn.textContent = "アルバム(HTML)を書き出す";
+    btn.textContent = "アルバムを書き出す";
   }
 });
 
