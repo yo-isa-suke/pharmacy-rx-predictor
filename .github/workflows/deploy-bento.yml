@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - claude/lunch-photo-memory-app-e2n055
+      - main
     paths:
       - "bento-diary/**"
       - ".github/workflows/deploy-bento.yml"
