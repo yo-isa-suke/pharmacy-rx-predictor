@@ -56,6 +56,7 @@ FORMAT_PRESETS = M["FORMAT_PRESETS"]
 haversine = M["haversine"]
 _clinic_annual_rx_pool = M["_clinic_annual_rx_pool"]
 _pharmacy_attractiveness = M["_pharmacy_attractiveness"]
+facility_key = M["facility_key"]
 
 
 @st.cache_resource
@@ -117,7 +118,8 @@ def make_hp():
 
 
 # ── ハフの取り分内訳（クリニック1行ずつ・自店の重み/競合の重み合計を明示） ─────────
-def huff_breakdown(med, ph, clat, clon, hp, a):
+def huff_breakdown(med, ph, clat, clon, hp, a, op_override=None):
+    op_override = op_override or {}
     comps = []
     for p in ph:
         if p.lat is None or p.lon is None:
@@ -138,7 +140,7 @@ def huff_breakdown(med, ph, clat, clon, hp, a):
         d_self = haversine(clat, clon, f.lat, f.lon)
         if d_self > hp.reach_m:
             continue
-        pool = _clinic_annual_rx_pool(f, a, {})
+        pool = _clinic_annual_rx_pool(f, a, op_override)
         if pool <= 0:
             continue
         self_w = bw(d_self, hp.candidate_attractiveness)
@@ -159,21 +161,29 @@ def huff_breakdown(med, ph, clat, clon, hp, a):
 def compute_candidate(raw):
     med, ph = raw["med"], raw["ph"]
     clat, clon, uni = raw["clat"], raw["clon"], raw["uni"]
+    label = raw["label"]
     a = PredictionAssumptions()
     hp = make_hp()
-    fp = make_fp(uni)
-    hb = huff_breakdown(med, ph, clat, clon, hp, a)
+    # 周知率（接触率）：館の来店客数のうち、その薬局に接触・到達する割合。手修正が優先。
+    exposure = float(st.session_state.get("exp_multi", {}).get(label, raw.get("exposure", 1.0)))
+    eff_uni = uni * exposure
+    fp = make_fp(eff_uni)
+    # 外来患者数の手修正（ナビィの誤り補正）：医療機関ベース(ハフ)に反映
+    op_override = st.session_state.get("op_multi", {}).get(label, {})
+    hb = huff_breakdown(med, ph, clat, clon, hp, a, op_override)
     med_total = sum(r["captured"] for r in hb)
     classified = classify_menkata(ph, med, clat, clon,
                                   monzen_dist=fp.menkata_monzen_dist,
                                   main_rx_threshold=fp.menkata_main_rx, reach_m=hp.reach_m)
-    override = st.session_state.get("mk_multi", {}).get(raw["label"], {})
+    override = st.session_state.get("mk_multi", {}).get(label, {})
     cpow, cn, cexc = footfall_competitor_power(classified, override, fp.competitor_decay_m,
                                                hp.national_avg_rx)
     foot = compute_footfall_prediction(fp, cpow)
     return {
-        "label": raw["label"], "name": raw["name"], "addr": raw["addr"], "uni": uni,
+        "label": label, "name": raw["name"], "addr": raw["addr"],
+        "uni": uni, "exposure": exposure, "eff_uni": eff_uni,
         "med": med, "ph": ph, "clat": clat, "clon": clon, "hp": hp, "fp": fp,
+        "op_override": op_override,
         "huff_rows": hb, "med_total": med_total, "classified": classified, "override": override,
         "comp_power": cpow, "comp_n": cn, "comp_excluded": cexc,
         "foot_total": (foot["total"] if foot else None), "foot": foot,
@@ -200,44 +210,53 @@ def _build_footfall_sheet(wb, r):
     ws["A1"].font = Font(bold=True, size=12)
     ws["A2"] = "【黄色のセルは編集できます。編集すると下の「獲得」が自動で再計算されます】"
     ws["A2"].font = Font(italic=True, size=9, color="B45309")
+    # 入力（B3..B12）※B5=有効客数は自動計算
+    ws.cell(row=3, column=1, value="館の来店客数（月間）")
+    ws.cell(row=3, column=2, value=r["uni"]).fill = _INP_FILL
+    ws.cell(row=4, column=1, value="周知率（接触率）")
+    ws.cell(row=4, column=2, value=r["exposure"]).fill = _INP_FILL
+    ws.cell(row=5, column=1, value="有効客数 ＝ 来店客数 × 周知率")
+    ec = ws.cell(row=5, column=2, value="=B3*B4")
+    ec.fill = _CALC_FILL
+    ec.font = _BOLD
     inputs = [
-        ("月間ユニーク客数", r["uni"]), ("65歳以上の比率", fp.ratio_65plus),
-        ("65+ 月受診回数", fp.visits_month_65plus), ("65- 月受診回数", fp.visits_month_under65),
-        ("処方箋発行率", fp.issue_rate), ("院外処方率", fp.external_rate),
-        ("当該薬局利用率", fp.use_rate), ("面競合の距離減衰λ(m)", fp.competitor_decay_m),
-    ]
+        ("65歳以上の比率", fp.ratio_65plus), ("65+ 月受診回数", fp.visits_month_65plus),
+        ("65- 月受診回数", fp.visits_month_under65), ("処方箋発行率", fp.issue_rate),
+        ("院外処方率", fp.external_rate), ("当該薬局利用率", fp.use_rate),
+        ("面競合の距離減衰λ(m)", fp.competitor_decay_m),
+    ]  # B6..B12
     for k, (lab, val) in enumerate(inputs):
-        rr = 3 + k
+        rr = 6 + k
         ws.cell(row=rr, column=1, value=lab)
         ws.cell(row=rr, column=2, value=val).fill = _INP_FILL
     computed = [
-        ("年間受診延べ(回)", "=(B3*B4*B5+B3*(1-B4)*B6)*12"),
-        ("院外処方プール(枚)", "=B12*B7*B8"),
-        ("面競合の実効パワー", "=SUM(E20:E500)"),
-        ("シェア", "=B9/(1+B14)"),
-        ("獲得（年間・枚）", "=B13*B15"),
-        ("獲得（月間・枚）", "=B16/12"),
-    ]
+        ("年間受診延べ(回)", "=(B5*B6*B7+B5*(1-B6)*B8)*12"),
+        ("院外処方プール(枚)", "=B14*B9*B10"),
+        ("面競合の実効パワー", "=SUM(E22:E500)"),
+        ("シェア", "=B11/(1+B16)"),
+        ("獲得（年間・枚）", "=B15*B17"),
+        ("獲得（月間・枚）", "=B18/12"),
+    ]  # B14..B19
     for k, (lab, f) in enumerate(computed):
-        rr = 12 + k
+        rr = 14 + k
         ws.cell(row=rr, column=1, value=lab)
         c = ws.cell(row=rr, column=2, value=f)
         c.fill = _CALC_FILL
-        if rr in (16, 17):
+        if rr in (18, 19):
             c.font = _BOLD
     for j, htxt in enumerate(["競合薬局名", "候補地から(m)", "実績(枚)", "面=1/門前=0", "重み(自動)"], start=1):
-        c = ws.cell(row=19, column=j, value=htxt)
+        c = ws.cell(row=21, column=j, value=htxt)
         c.font = _HDR
         c.fill = _HDR_FILL
     for k, cl in enumerate(r["classified"]):
-        rr = 20 + k
+        rr = 22 + k
         eff = r["override"].get(cl["key"], cl["auto_menkata"])
         ws.cell(row=rr, column=1, value=cl["name"])
         ws.cell(row=rr, column=2, value=round(cl["d_cand"])).fill = _INP_FILL
         ws.cell(row=rr, column=3, value=int(cl["rx"]) if cl["rx"] else 0).fill = _INP_FILL
         ws.cell(row=rr, column=4, value=(1 if eff else 0)).fill = _INP_FILL
         ws.cell(row=rr, column=5,
-                value=f"=IF(D{rr}=1,IF(C{rr}>0,C{rr}/12000,1)*EXP(-B{rr}/$B$10),0)").fill = _CALC_FILL
+                value=f"=IF(D{rr}=1,IF(C{rr}>0,C{rr}/12000,1)*EXP(-B{rr}/$B$12),0)").fill = _CALC_FILL
     for col, w in zip("ABCDE", [30, 14, 12, 14, 14]):
         ws.column_dimensions[col].width = w
 
@@ -343,8 +362,8 @@ def _build_summary_sheet(ws, results):
             4: f"='{md}'!B7", 5: f"='{md}'!D7",
         }
         if r["foot_total"] is not None:
-            vals[6] = f"='{ff}'!B16"
-            vals[7] = f"='{ff}'!B17"
+            vals[6] = f"='{ff}'!B18"
+            vals[7] = f"='{ff}'!B19"
         vals[8] = (f'=IF(AND(ISNUMBER(D{row}),ISNUMBER(F{row})),'
                    f'TEXT(MIN(D{row},F{row}),"#,##0")&"〜"&TEXT(MAX(D{row},F{row}),"#,##0"),"—")')
         is_best = (r["label"] == best_label)
@@ -409,9 +428,9 @@ st.caption("候補地ごとに ラベル・店舗名/メモ・住所・月間ユ
 
 if "cand_df" not in st.session_state:
     st.session_state["cand_df"] = pd.DataFrame([
-        {"ラベル": "A", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0},
-        {"ラベル": "B", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0},
-        {"ラベル": "C", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0},
+        {"ラベル": "A", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
+        {"ラベル": "B", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
+        {"ラベル": "C", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
     ])
 
 cand_edited = st.data_editor(
@@ -421,8 +440,15 @@ cand_edited = st.data_editor(
         "店舗名/メモ": st.column_config.TextColumn("店舗名/メモ"),
         "住所": st.column_config.TextColumn("住所", width="large"),
         "月間ユニーク客数": st.column_config.NumberColumn("月間ユニーク客数", min_value=0, step=500),
+        "周知率": st.column_config.NumberColumn(
+            "周知率", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
+            help="館の来店客のうち、その薬局に接触・到達する割合。"
+                 "食品スーパー=1.0／大型モール1階・主動線沿い=0.3／上層階・動線外=0.1。後から候補地ごとに変更可。",
+        ),
     },
 )
+st.caption("💡 **周知率**：食品スーパー=**1.0**（既定）／大型モール1階・主動線=**0.3**／上層階・動線外=**0.1**。"
+           "館の来店客数が大きくても、薬局に接触する割合を掛けて過大予測を防ぎます。")
 
 run = st.button("▶ 全候補地を分析する", type="primary")
 
@@ -456,12 +482,16 @@ if run:
         if clat is None:
             st.error(f"[{label}] 住所の座標が取得できませんでした：{addr}")
             continue
+        exposure = float(row.get("周知率") if row.get("周知率") is not None else 1.0)
         raws.append({"label": label, "name": str(row.get("店舗名/メモ") or ""),
-                     "addr": addr, "uni": uni, "clat": clat, "clon": clon, "med": med, "ph": ph})
+                     "addr": addr, "uni": uni, "exposure": exposure,
+                     "clat": clat, "clon": clon, "med": med, "ph": ph})
     overall.progress(1.0, text="完了")
     overall.empty()
     st.session_state["multi_raw"] = raws
-    st.session_state["mk_multi"] = {}   # 面/門前の手修正はリセット
+    st.session_state["mk_multi"] = {}    # 面/門前の手修正はリセット
+    st.session_state["exp_multi"] = {}   # 周知率の手修正はリセット（表の初期値を使う）
+    st.session_state["op_multi"] = {}    # 外来補正はリセット
 
 
 # ── 結果の比較表示（毎回、現在の設定＋手修正で再計算） ──────────────────────────
@@ -522,11 +552,48 @@ if raws:
         "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
     })
 
+    with st.expander("✏️ 外来患者数の補正（ナビィの誤りを手修正 → ①に反映）"):
+        st.caption("ナビィの外来患者数が誤っている医療機関は、正しい1日平均外来患者数を入力すると"
+                   "①医療機関ベース（ハフ）に反映されます（空欄＝ナビィ値）。")
+        op_all = st.session_state.setdefault("op_multi", {})
+        op_cur = op_all.setdefault(sel, {})
+        df_op = pd.DataFrame([{
+            "医療機関": f.name,
+            "距離(m)": int(f.distance_m) if f.distance_m is not None else None,
+            "ナビィ外来(人/日)": f.daily_outpatients,
+            "補正外来(人/日)": op_cur.get(facility_key(f)),
+            "_key": facility_key(f),
+        } for f in sorted(c["med"], key=lambda x: x.distance_m or 9e9)])
+        edited_op = st.data_editor(
+            df_op, hide_index=True, use_container_width=True, key=f"op_editor_{sel}",
+            disabled=["医療機関", "距離(m)", "ナビィ外来(人/日)", "_key"],
+            column_config={"補正外来(人/日)": st.column_config.NumberColumn(
+                "補正外来(人/日)", min_value=0, max_value=20000, step=1,
+                help="病院HP・年報等の正しい1日平均外来患者数。空欄でナビィ値。")},
+        )
+        new_op = {}
+        for _, rr in edited_op.iterrows():
+            v = rr.get("補正外来(人/日)")
+            if v is not None and not pd.isna(v) and float(v) > 0:
+                new_op[rr["_key"]] = float(v)
+        if new_op != op_cur:
+            op_all[sel] = new_op
+            st.rerun()
+
     if c["foot"]:
         st.markdown("##### ② 集客ベース：内訳")
         fo, fp = c["foot"], c["fp"]
+        exp_all = st.session_state.setdefault("exp_multi", {})
+        new_exp = st.number_input(
+            f"周知率（{sel}）— 館の来店客のうち薬局に接触する割合", 0.0, 1.0,
+            float(c["exposure"]), 0.05, format="%.2f", key=f"exp_{sel}",
+            help="食品スーパー=1.0／大型モール1階・主動線=0.3／上層階・動線外=0.1。変更すると②が再計算されます。",
+        )
+        if abs(new_exp - c["exposure"]) > 1e-9:
+            exp_all[sel] = new_exp
+            st.rerun()
         st.markdown(
-            f"- 月間ユニーク客 {fp.unique_customers_monthly:,.0f}人"
+            f"- 館の来店客数 {c['uni']:,.0f}人 × **周知率 {c['exposure']:.2f}** = 有効客数 **{c['eff_uni']:,.0f}人**"
             f"（65+ {fo['u65']:,.0f} / 65− {fo['u_under']:,.0f}）\n"
             f"- 年間受診延べ {fo['annual_visits']:,.0f}回 → 院外処方プール {fo['rx_pool']:,.0f}枚\n"
             f"- 利用率 {fp.use_rate:.1%} ÷ (面競合の実効パワー {c['comp_power']:.1f}"
