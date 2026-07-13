@@ -52,7 +52,6 @@ FootfallParams = M["FootfallParams"]
 compute_footfall_prediction = M["compute_footfall_prediction"]
 classify_menkata = M["classify_menkata"]
 footfall_competitor_power = M["footfall_competitor_power"]
-FORMAT_PRESETS = M["FORMAT_PRESETS"]
 haversine = M["haversine"]
 _clinic_annual_rx_pool = M["_clinic_annual_rx_pool"]
 _pharmacy_attractiveness = M["_pharmacy_attractiveness"]
@@ -75,9 +74,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🛒 集客ベースの前提（全候補地に共通）")
-    store_format = st.selectbox("店舗形態", list(FORMAT_PRESETS.keys()), index=1)
-    _pre = FORMAT_PRESETS[store_format]
-    ff_r65 = st.number_input("65歳以上の比率", 0.0, 1.0, float(_pre["r65"]), 0.01)
+    ff_r65 = st.number_input("65歳以上の比率（商圏の高齢化率）", 0.0, 1.0, 0.30, 0.01,
+                             help="来店客の年齢構成。会員の年齢データがあればその比率、なければ商圏の高齢化率。")
     c1, c2 = st.columns(2)
     ff_v65 = c1.number_input("65+ の月受診回数", 0.0, 6.0, 3.0, 0.1)
     ff_vu65 = c2.number_input("65- の月受診回数", 0.0, 6.0, 1.3, 0.1)
@@ -103,7 +101,7 @@ with st.sidebar:
 
 def make_fp(uni):
     return FootfallParams(
-        enabled=(uni > 0), store_format=store_format,
+        enabled=(uni > 0),
         unique_customers_monthly=float(uni), ratio_65plus=float(ff_r65),
         visits_month_65plus=float(ff_v65), visits_month_under65=float(ff_vu65),
         issue_rate=float(ff_issue), external_rate=float(ff_ext), use_rate=float(ff_use),
