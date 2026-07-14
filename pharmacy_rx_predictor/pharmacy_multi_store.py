@@ -68,8 +68,17 @@ with st.sidebar:
     st.header("共通設定")
     radius_m = st.slider("商圏半径 (m)", 500, 5000, 3000, 100,
                          help="スーパー商圏に準拠。全候補地に共通で使います。")
-    max_detail = st.slider("詳細取得件数（薬局）", 5, 60, 30, 5,
-                           help="ナビィから実績・座標を取る薬局の上限（多いほど正確・遅い）。")
+    fetch_all_ph = st.checkbox(
+        "商圏内の薬局を全件取得（重み付けを最も正確に・ただし遅い）", value=True,
+        help="ON：商圏内の全薬局の詳細（正確な座標・実績）を取得し、門前判定・実績を最も正確にします。"
+             "OFF：近い順に指定件数だけ詳細取得（遠い競合も座標は取得済みで按分には入ります）。",
+    )
+    if fetch_all_ph:
+        max_detail = 9999
+        st.caption("→ 商圏内の薬局を全件取得します（速度優先にしたい場合はチェックを外すと件数指定が出ます）。")
+    else:
+        max_detail = int(st.slider("詳細取得件数（薬局）", 5, 120, 30, 5,
+                                   help="ナビィから実績・座標を取る薬局の上限（多いほど正確・遅い）。"))
     gate_m = 50
 
     st.divider()
@@ -94,6 +103,12 @@ with st.sidebar:
     with st.expander("⚙️ 詳細設定（ハフ按分・通常は変更不要）", expanded=False):
         huff_lambda = st.slider("距離減衰 λ (m)", 150, 900, 250, 50)
         huff_boost = st.slider("門前ブースト", 1.0, 15.0, 8.0, 0.5)
+        huff_monzen_r = st.slider(
+            "門前ブースト半径 (m)", 30, 150, 50, 10,
+            help="①医療機関ベースで、クリニックからこの距離以内の薬局に門前ブーストを掛けます。"
+                 "実質“門前”が80〜100mにある場合はここを広げてください（既定50mは275店検証時の値のため、"
+                 "広げた場合は再較正が望ましい）。",
+        )
         huff_candA = st.number_input("候補店の引力（大型店は上げる）", 0.2, 10.0, 1.0, 0.1)
 
     st.caption("※ サイドバーや面/門前を変えると、再検索なしで比較表・Excelが即更新されます。")
@@ -112,7 +127,7 @@ def make_fp(uni):
 
 def make_hp():
     return HuffParams(lambda_m=float(huff_lambda), monzen_boost=float(huff_boost),
-                      candidate_attractiveness=float(huff_candA), monzen_radius=float(gate_m))
+                      candidate_attractiveness=float(huff_candA), monzen_radius=float(huff_monzen_r))
 
 
 # ── ハフの取り分内訳（クリニック1行ずつ・自店の重み/競合の重み合計を明示） ─────────
