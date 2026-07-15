@@ -587,7 +587,16 @@ cand_edited = st.data_editor(
 st.caption("💡 **周知率**：食品スーパー=**1.0**（既定）／大型モール1階・主動線=**0.3**／上層階・動線外=**0.1**。"
            "館の来店客数が大きくても、薬局に接触する割合を掛けて過大予測を防ぎます。")
 
-run = st.button("▶ 全候補地を分析する", type="primary")
+col_run, col_clear = st.columns([3, 1])
+run = col_run.button("▶ 未分析の候補地を分析（続きから）", type="primary", use_container_width=True)
+if col_clear.button("🗑 結果をクリア", use_container_width=True):
+    for k in ("mk_multi", "exp_multi", "med_edit", "ph_edit"):
+        st.session_state[k] = {}
+    st.session_state["multi_raw"] = []
+    st.rerun()
+st.caption("※ 分析は**1店ずつ完了と同時に保存**されます。途中で止まっても完了分は残り、もう一度押せば"
+           "**続きから**処理します。3店同時＋全件取得ONは長時間になり中断されやすいので、"
+           "**うまくいかない時は1〜2店ずつ、または全件取得をOFF**にしてお試しください。")
 
 if run:
     scraper = get_scraper()
@@ -596,40 +605,46 @@ if run:
     if not targets:
         st.warning("住所を1件以上入力してください。")
         st.stop()
-    st.info(f"{len(targets)}件の候補地を順番に分析します（1件あたり数分。混雑時は10分以上かかる場合があります）。")
-    raws = []
-    overall = st.progress(0.0, text="開始…")
+    existing = st.session_state.setdefault("multi_raw", [])
+    done_labels = {r["label"] for r in existing}
+    todo = []
     for i, row in enumerate(targets):
         label = str(row.get("ラベル") or f"#{i+1}").strip()
-        addr = str(row["住所"]).strip()
-        uni = float(row.get("月間ユニーク客数") or 0)
-        overall.progress(i / len(targets), text=f"[{label}] {addr} を分析中… ({i+1}/{len(targets)})")
-        log = []
-        prog = st.progress(0.0, text=f"[{label}] 収集中…")
-        try:
-            med, ph, clat, clon = run_analysis(
-                addr, int(radius_m), gate_m, int(max_detail), log, prog,
-                assumptions=assumptions, polygons=[], exclude_outside_med=True,
-            )
-            prog.empty()
-        except Exception as e:
-            prog.empty()
-            st.error(f"[{label}] 分析に失敗: {e}")
-            continue
-        if clat is None:
-            st.error(f"[{label}] 住所の座標が取得できませんでした：{addr}")
-            continue
-        exposure = float(row.get("周知率") if row.get("周知率") is not None else 1.0)
-        raws.append({"label": label, "name": str(row.get("店舗名/メモ") or ""),
-                     "addr": addr, "uni": uni, "exposure": exposure,
-                     "clat": clat, "clon": clon, "med": med, "ph": ph})
-    overall.progress(1.0, text="完了")
-    overall.empty()
-    st.session_state["multi_raw"] = raws
-    st.session_state["mk_multi"] = {}    # 面/門前の手修正はリセット
-    st.session_state["exp_multi"] = {}   # 周知率の手修正はリセット（表の初期値を使う）
-    st.session_state["med_edit"] = {}    # 医療機関の座標補正・追加/削除はリセット
-    st.session_state["ph_edit"] = {}     # 薬局の座標補正・追加/削除はリセット
+        if label not in done_labels:
+            todo.append((label, row))
+    if not todo:
+        st.info("入力中の候補地はすべて分析済みです。やり直すには『🗑 結果をクリア』を押してください。")
+    else:
+        st.info(f"未分析 {len(todo)}件を順に分析します（1件あたり数分。全件取得ONだと更に時間がかかります）。")
+        overall = st.progress(0.0, text="開始…")
+        for i, (label, row) in enumerate(todo):
+            addr = str(row["住所"]).strip()
+            uni = float(row.get("月間ユニーク客数") or 0)
+            overall.progress(i / len(todo), text=f"[{label}] {addr} を分析中… ({i+1}/{len(todo)})")
+            log = []
+            prog = st.progress(0.0, text=f"[{label}] 収集中…")
+            try:
+                med, ph, clat, clon = run_analysis(
+                    addr, int(radius_m), gate_m, int(max_detail), log, prog,
+                    assumptions=assumptions, polygons=[], exclude_outside_med=True,
+                )
+                prog.empty()
+            except Exception as e:
+                prog.empty()
+                st.error(f"[{label}] 分析に失敗: {e}")
+                continue
+            if clat is None:
+                st.error(f"[{label}] 住所の座標が取得できませんでした：{addr}")
+                continue
+            exposure = float(row.get("周知率") if row.get("周知率") is not None else 1.0)
+            # ★完了と同時に保存（中断されても、ここまで完了した店は残る）
+            st.session_state["multi_raw"].append({
+                "label": label, "name": str(row.get("店舗名/メモ") or ""),
+                "addr": addr, "uni": uni, "exposure": exposure,
+                "clat": clat, "clon": clon, "med": med, "ph": ph})
+        overall.progress(1.0, text="完了")
+        overall.empty()
+        st.rerun()
 
 
 # ── 結果の比較表示（毎回、現在の設定＋手修正で再計算） ──────────────────────────
