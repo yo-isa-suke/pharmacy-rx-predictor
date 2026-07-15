@@ -16,6 +16,7 @@ import io
 import math
 import os
 import re
+from dataclasses import replace
 
 import pandas as pd
 import streamlit as st
@@ -56,6 +57,95 @@ haversine = M["haversine"]
 _clinic_annual_rx_pool = M["_clinic_annual_rx_pool"]
 _pharmacy_attractiveness = M["_pharmacy_attractiveness"]
 facility_key = M["facility_key"]
+pharmacy_key = M["pharmacy_key"]
+MedFacility = M["MedFacility"]
+PharmacyFacility = M["PharmacyFacility"]
+
+
+def _num(v):
+    """pandas由来のNaN/None/空 を None に、数値は float にする。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f  # NaN 除外
+
+
+def _reposition(clat, clon, flat, flon, target_dist):
+    """候補地→現在地の向きを保ったまま、距離だけ target_dist(m) に補正した座標を返す。"""
+    cur = haversine(clat, clon, flat, flon)
+    if cur <= 0 or target_dist <= 0:
+        return flat, flon
+    ratio = target_dist / cur
+    return clat + (flat - clat) * ratio, clon + (flon - clon) * ratio
+
+
+def _recs_sig(recs, numfield):
+    """編集レコードの正規化シグネチャ（float揺れによる無限再実行を防ぐ比較用）。"""
+    out = []
+    for r in recs:
+        la, lo, nv = _num(r.get("lat")), _num(r.get("lon")), _num(r.get(numfield))
+        out.append(((r.get("name") or "").strip(),
+                    round(la, 6) if la is not None else None,
+                    round(lo, 6) if lo is not None else None,
+                    round(nv, 1) if nv is not None else None))
+    return out
+
+
+def effective_facilities(raw, clat, clon, label):
+    """
+    生データ＋候補地ごとの編集（座標補正・削除・手動追加）を反映した実効の医療機関/薬局リストを返す。
+    編集内容は session_state['med_edit'][label] / ['ph_edit'][label] に行レコードで保持。
+    """
+    med_edit = st.session_state.setdefault("med_edit", {})
+    ph_edit = st.session_state.setdefault("ph_edit", {})
+    if label not in med_edit:
+        med_edit[label] = [{"name": f.name, "lat": f.lat, "lon": f.lon,
+                            "op": f.daily_outpatients, "_key": facility_key(f)} for f in raw["med"]]
+    if label not in ph_edit:
+        ph_edit[label] = [{"name": p.name, "lat": p.lat, "lon": p.lon,
+                           "rx": p.annual_rx_count, "_key": pharmacy_key(p)} for p in raw["ph"]]
+    raw_med_map = {facility_key(f): f for f in raw["med"]}
+    raw_ph_map = {pharmacy_key(p): p for p in raw["ph"]}
+
+    med_eff = []
+    for r in med_edit[label]:
+        name = (r.get("name") or "").strip()
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        if not name or lat is None or lon is None:
+            continue
+        op = _num(r.get("op"))
+        base = raw_med_map.get(r.get("_key"))
+        if base is not None:
+            f = replace(base, lat=lat, lon=lon,
+                        daily_outpatients=(int(op) if op else base.daily_outpatients))
+        else:
+            f = MedFacility(name=name, lat=lat, lon=lon,
+                            daily_outpatients=(int(op) if op else None),
+                            rx_summary="院外処方あり", facility_category="診療所",
+                            source="手動追加")
+        f.distance_m = haversine(clat, clon, lat, lon)
+        med_eff.append(f)
+
+    ph_eff = []
+    for r in ph_edit[label]:
+        name = (r.get("name") or "").strip()
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        if not name or lat is None or lon is None:
+            continue
+        rx = _num(r.get("rx"))
+        base = raw_ph_map.get(r.get("_key"))
+        if base is not None:
+            p = replace(base, lat=lat, lon=lon,
+                        annual_rx_count=(int(rx) if rx else base.annual_rx_count))
+        else:
+            p = PharmacyFacility(name=name, address="", lat=lat, lon=lon,
+                                 annual_rx_count=(int(rx) if rx else None), source="手動追加")
+        p.distance_m = haversine(clat, clon, lat, lon)
+        ph_eff.append(p)
+    return med_eff, ph_eff
 
 
 @st.cache_resource
@@ -172,18 +262,17 @@ def huff_breakdown(med, ph, clat, clon, hp, a, op_override=None):
 
 # ── 生データ＋現在の設定/手修正から、両トラックを算出（再検索なしで即再計算） ──────
 def compute_candidate(raw):
-    med, ph = raw["med"], raw["ph"]
     clat, clon, uni = raw["clat"], raw["clon"], raw["uni"]
     label = raw["label"]
     a = PredictionAssumptions()
     hp = make_hp()
+    # 座標補正・削除・手動追加を反映した実効の医療機関/薬局リスト（①②の両方に効く）
+    med, ph = effective_facilities(raw, clat, clon, label)
     # 周知率（接触率）：館の来店客数のうち、その薬局に接触・到達する割合。手修正が優先。
     exposure = float(st.session_state.get("exp_multi", {}).get(label, raw.get("exposure", 1.0)))
     eff_uni = uni * exposure
     fp = make_fp(eff_uni)
-    # 外来患者数の手修正（ナビィの誤り補正）：医療機関ベース(ハフ)に反映
-    op_override = st.session_state.get("op_multi", {}).get(label, {})
-    hb = huff_breakdown(med, ph, clat, clon, hp, a, op_override)
+    hb = huff_breakdown(med, ph, clat, clon, hp, a)
     med_total = sum(r["captured"] for r in hb)
     classified = classify_menkata(ph, med, clat, clon,
                                   monzen_dist=fp.menkata_monzen_dist,
@@ -196,7 +285,6 @@ def compute_candidate(raw):
         "label": label, "name": raw["name"], "addr": raw["addr"],
         "uni": uni, "exposure": exposure, "eff_uni": eff_uni,
         "med": med, "ph": ph, "clat": clat, "clon": clon, "hp": hp, "fp": fp,
-        "op_override": op_override,
         "huff_rows": hb, "med_total": med_total, "classified": classified, "override": override,
         "comp_power": cpow, "comp_n": cn, "comp_excluded": cexc,
         "foot_total": (foot["total"] if foot else None), "foot": foot,
@@ -504,7 +592,8 @@ if run:
     st.session_state["multi_raw"] = raws
     st.session_state["mk_multi"] = {}    # 面/門前の手修正はリセット
     st.session_state["exp_multi"] = {}   # 周知率の手修正はリセット（表の初期値を使う）
-    st.session_state["op_multi"] = {}    # 外来補正はリセット
+    st.session_state["med_edit"] = {}    # 医療機関の座標補正・追加/削除はリセット
+    st.session_state["ph_edit"] = {}     # 薬局の座標補正・追加/削除はリセット
 
 
 # ── 結果の比較表示（毎回、現在の設定＋手修正で再計算） ──────────────────────────
@@ -565,32 +654,46 @@ if raws:
         "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
     })
 
-    with st.expander("✏️ 外来患者数の補正（ナビィの誤りを手修正 → ①に反映）"):
-        st.caption("ナビィの外来患者数が誤っている医療機関は、正しい1日平均外来患者数を入力すると"
-                   "①医療機関ベース（ハフ）に反映されます（空欄＝ナビィ値）。")
-        op_all = st.session_state.setdefault("op_multi", {})
-        op_cur = op_all.setdefault(sel, {})
-        df_op = pd.DataFrame([{
-            "医療機関": f.name,
-            "距離(m)": int(f.distance_m) if f.distance_m is not None else None,
-            "ナビィ外来(人/日)": f.daily_outpatients,
-            "補正外来(人/日)": op_cur.get(facility_key(f)),
-            "_key": facility_key(f),
-        } for f in sorted(c["med"], key=lambda x: x.distance_m or 9e9)])
-        edited_op = st.data_editor(
-            df_op, hide_index=True, use_container_width=True, key=f"op_editor_{sel}",
-            disabled=["医療機関", "距離(m)", "ナビィ外来(人/日)", "_key"],
-            column_config={"補正外来(人/日)": st.column_config.NumberColumn(
-                "補正外来(人/日)", min_value=0, max_value=20000, step=1,
-                help="病院HP・年報等の正しい1日平均外来患者数。空欄でナビィ値。")},
+    with st.expander("🔧 医療機関の確認・修正（座標補正／外来数／漏れの追加・削除 → ①に反映）", expanded=False):
+        st.caption(
+            "『距離(m)』が実態と大きく違う施設は、座標(緯度・経度)がズレています。"
+            "Googleマップの正しい座標を緯度・経度に入れると距離が再計算され①に反映されます"
+            "（距離(m)を直接入力しても補正可＝向きは元のまま／最も正確なのは緯度経度）。"
+            "行を追加すれば漏れたクリニックを足せます。行を削除すれば誤検出を外せます。"
         )
-        new_op = {}
-        for _, rr in edited_op.iterrows():
-            v = rr.get("補正外来(人/日)")
-            if v is not None and not pd.isna(v) and float(v) > 0:
-                new_op[rr["_key"]] = float(v)
-        if new_op != op_cur:
-            op_all[sel] = new_op
+        med_edit = st.session_state.setdefault("med_edit", {})
+        recs = med_edit.get(sel, [])
+        disp = pd.DataFrame([{
+            "医療機関": r.get("name"),
+            "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
+                       if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
+            "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
+            "外来(人/日)": r.get("op"), "_key": r.get("_key"),
+        } for r in sorted(recs, key=lambda x: (
+            haversine(c["clat"], c["clon"], _num(x.get("lat")), _num(x.get("lon")))
+            if (_num(x.get("lat")) is not None and _num(x.get("lon")) is not None) else 9e9))])
+        ed = st.data_editor(
+            disp, hide_index=True, use_container_width=True, num_rows="dynamic",
+            key=f"med_edit_{sel}", disabled=["距離(m)", "_key"],
+            column_config={
+                "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
+                "経度": st.column_config.NumberColumn("経度", format="%.6f"),
+                "距離(m)": st.column_config.NumberColumn("距離(m)", help="緯度経度から自動計算。直接入力しても補正可（向き保持）。"),
+                "外来(人/日)": st.column_config.NumberColumn("外来(人/日)", min_value=0, step=1),
+            },
+        )
+        new_recs = []
+        for _, row in ed.iterrows():
+            name = (str(row.get("医療機関")) if row.get("医療機関") is not None else "").strip()
+            lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
+            dist, op = _num(row.get("距離(m)")), _num(row.get("外来(人/日)"))
+            if lat is not None and lon is not None and dist is not None:
+                if abs(dist - haversine(c["clat"], c["clon"], lat, lon)) > 1:
+                    lat, lon = _reposition(c["clat"], c["clon"], lat, lon, dist)
+            if name or (lat is not None and lon is not None):
+                new_recs.append({"name": name, "lat": lat, "lon": lon, "op": op, "_key": row.get("_key")})
+        if _recs_sig(new_recs, "op") != _recs_sig(recs, "op"):
+            med_edit[sel] = new_recs
             st.rerun()
 
     if c["foot"]:
@@ -642,18 +745,45 @@ if raws:
         mk_all[sel] = new_ov
         st.rerun()
 
-    with st.expander("🏥 医療機関の一覧"):
-        st.dataframe(pd.DataFrame([{
-            "医療機関": f.name, "距離(m)": int(f.distance_m) if f.distance_m is not None else None,
-            "外来(人/日)": f.daily_outpatients, "院内外": f.rx_summary, "種別": f.facility_category,
-        } for f in sorted(c["med"], key=lambda x: x.distance_m or 9e9)]),
-            hide_index=True, use_container_width=True)
-    with st.expander("💊 薬局の一覧"):
-        st.dataframe(pd.DataFrame([{
-            "薬局": p.name, "距離(m)": int(p.distance_m) if p.distance_m is not None else None,
-            "実績(枚/年)": p.annual_rx_count,
-        } for p in sorted(c["ph"], key=lambda x: x.distance_m or 9e9)]),
-            hide_index=True, use_container_width=True)
+    with st.expander("🔧 薬局の確認・修正（座標補正／実績／漏れの追加・削除 → ①②に反映）", expanded=False):
+        st.caption(
+            "門前薬局が漏れていると①の重み付けが狂います。座標(緯度・経度)がズレている薬局は正しい値に直し、"
+            "漏れている薬局は行を追加してください（重み付けに即反映）。距離(m)を直接入力しても補正できます。"
+        )
+        ph_edit = st.session_state.setdefault("ph_edit", {})
+        precs = ph_edit.get(sel, [])
+        pdisp = pd.DataFrame([{
+            "薬局": r.get("name"),
+            "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
+                       if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
+            "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
+            "実績(枚/年)": r.get("rx"), "_key": r.get("_key"),
+        } for r in sorted(precs, key=lambda x: (
+            haversine(c["clat"], c["clon"], _num(x.get("lat")), _num(x.get("lon")))
+            if (_num(x.get("lat")) is not None and _num(x.get("lon")) is not None) else 9e9))])
+        ped = st.data_editor(
+            pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
+            key=f"ph_edit_{sel}", disabled=["距離(m)", "_key"],
+            column_config={
+                "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
+                "経度": st.column_config.NumberColumn("経度", format="%.6f"),
+                "距離(m)": st.column_config.NumberColumn("距離(m)", help="緯度経度から自動計算。直接入力しても補正可（向き保持）。"),
+                "実績(枚/年)": st.column_config.NumberColumn("実績(枚/年)", min_value=0, step=100),
+            },
+        )
+        pnew = []
+        for _, row in ped.iterrows():
+            name = (str(row.get("薬局")) if row.get("薬局") is not None else "").strip()
+            lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
+            dist, rx = _num(row.get("距離(m)")), _num(row.get("実績(枚/年)"))
+            if lat is not None and lon is not None and dist is not None:
+                if abs(dist - haversine(c["clat"], c["clon"], lat, lon)) > 1:
+                    lat, lon = _reposition(c["clat"], c["clon"], lat, lon, dist)
+            if name or (lat is not None and lon is not None):
+                pnew.append({"name": name, "lat": lat, "lon": lon, "rx": rx, "_key": row.get("_key")})
+        if _recs_sig(pnew, "rx") != _recs_sig(precs, "rx"):
+            ph_edit[sel] = pnew
+            st.rerun()
 
     # ── 4. Excel ─────────────────────────────────────────────────────────────
     st.markdown("#### 4. 数式入りExcelで書き出し")
