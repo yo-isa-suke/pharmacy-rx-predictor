@@ -94,6 +94,42 @@ def _recs_sig(recs, numfield):
     return out
 
 
+def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon):
+    """
+    編集後の data_editor 内容を、保存用レコードに解決する。行ごとに：
+      ・緯度/経度を編集した → その座標を採用
+      ・距離(m)だけ編集した → 元座標の向きを保って距離を補正
+      ・新規行 → 緯度経度があれば採用、無く距離だけなら候補地の真北に仮置き
+    """
+    smap = {s.get("_key"): s for s in stored if isinstance(s.get("_key"), str) and s.get("_key")}
+    out = []
+    for _, row in ed.iterrows():
+        name = (str(row.get(name_col)) if row.get(name_col) is not None else "").strip()
+        lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
+        dist, nv = _num(row.get("距離(m)")), _num(row.get(num_disp))
+        key = row.get("_key")
+        key = key if (isinstance(key, str) and key) else None
+        s = smap.get(key)
+        if s is not None:
+            slat, slon = _num(s.get("lat")), _num(s.get("lon"))
+            sdist = (haversine(clat, clon, slat, slon)
+                     if (slat is not None and slon is not None) else None)
+            coords_edited = (slat is not None and lat is not None and lon is not None
+                             and (abs(lat - slat) > 1e-9 or abs(lon - slon) > 1e-9))
+            if coords_edited:
+                pass  # 編集した緯度経度を採用
+            elif dist is not None and sdist is not None and abs(dist - sdist) > 1:
+                lat, lon = _reposition(clat, clon, slat, slon, dist)  # 距離だけ補正
+            else:
+                lat, lon = slat, slon  # 変更なし
+        else:
+            if (lat is None or lon is None) and dist is not None and dist > 0:
+                lat, lon = clat + dist / 111000.0, clon  # 新規・距離のみ→真北に仮置き
+        if name or (lat is not None and lon is not None):
+            out.append({"name": name, "lat": lat, "lon": lon, num_store: nv, "_key": key})
+    return out
+
+
 def effective_facilities(raw, clat, clon, label):
     """
     生データ＋候補地ごとの編集（座標補正・削除・手動追加）を反映した実効の医療機関/薬局リストを返す。
@@ -669,29 +705,18 @@ if raws:
                        if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
             "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
             "外来(人/日)": r.get("op"), "_key": r.get("_key"),
-        } for r in sorted(recs, key=lambda x: (
-            haversine(c["clat"], c["clon"], _num(x.get("lat")), _num(x.get("lon")))
-            if (_num(x.get("lat")) is not None and _num(x.get("lon")) is not None) else 9e9))])
+        } for r in recs])
         ed = st.data_editor(
             disp, hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"med_edit_{sel}", disabled=["距離(m)", "_key"],
+            key=f"med_edit_{sel}", disabled=["_key"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
-                "距離(m)": st.column_config.NumberColumn("距離(m)", help="緯度経度から自動計算。直接入力しても補正可（向き保持）。"),
+                "距離(m)": st.column_config.NumberColumn("距離(m)", help="ここに正しい距離を直接入力しても補正できます（向きは保持）。最も正確なのは緯度経度の修正。"),
                 "外来(人/日)": st.column_config.NumberColumn("外来(人/日)", min_value=0, step=1),
             },
         )
-        new_recs = []
-        for _, row in ed.iterrows():
-            name = (str(row.get("医療機関")) if row.get("医療機関") is not None else "").strip()
-            lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
-            dist, op = _num(row.get("距離(m)")), _num(row.get("外来(人/日)"))
-            if lat is not None and lon is not None and dist is not None:
-                if abs(dist - haversine(c["clat"], c["clon"], lat, lon)) > 1:
-                    lat, lon = _reposition(c["clat"], c["clon"], lat, lon, dist)
-            if name or (lat is not None and lon is not None):
-                new_recs.append({"name": name, "lat": lat, "lon": lon, "op": op, "_key": row.get("_key")})
+        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"])
         if _recs_sig(new_recs, "op") != _recs_sig(recs, "op"):
             med_edit[sel] = new_recs
             st.rerun()
@@ -758,29 +783,18 @@ if raws:
                        if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
             "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
             "実績(枚/年)": r.get("rx"), "_key": r.get("_key"),
-        } for r in sorted(precs, key=lambda x: (
-            haversine(c["clat"], c["clon"], _num(x.get("lat")), _num(x.get("lon")))
-            if (_num(x.get("lat")) is not None and _num(x.get("lon")) is not None) else 9e9))])
+        } for r in precs])
         ped = st.data_editor(
             pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"ph_edit_{sel}", disabled=["距離(m)", "_key"],
+            key=f"ph_edit_{sel}", disabled=["_key"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
-                "距離(m)": st.column_config.NumberColumn("距離(m)", help="緯度経度から自動計算。直接入力しても補正可（向き保持）。"),
+                "距離(m)": st.column_config.NumberColumn("距離(m)", help="ここに正しい距離を直接入力しても補正できます（向きは保持）。最も正確なのは緯度経度の修正。"),
                 "実績(枚/年)": st.column_config.NumberColumn("実績(枚/年)", min_value=0, step=100),
             },
         )
-        pnew = []
-        for _, row in ped.iterrows():
-            name = (str(row.get("薬局")) if row.get("薬局") is not None else "").strip()
-            lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
-            dist, rx = _num(row.get("距離(m)")), _num(row.get("実績(枚/年)"))
-            if lat is not None and lon is not None and dist is not None:
-                if abs(dist - haversine(c["clat"], c["clon"], lat, lon)) > 1:
-                    lat, lon = _reposition(c["clat"], c["clon"], lat, lon, dist)
-            if name or (lat is not None and lon is not None):
-                pnew.append({"name": name, "lat": lat, "lon": lon, "rx": rx, "_key": row.get("_key")})
+        pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
         if _recs_sig(pnew, "rx") != _recs_sig(precs, "rx"):
             ph_edit[sel] = pnew
             st.rerun()
