@@ -13,7 +13,6 @@
   原資・重みを編集すると医療機関(ハフ)の獲得が、Excel上で自動で再計算される。
 """
 import io
-import json
 import math
 import os
 import re
@@ -324,76 +323,6 @@ with st.sidebar:
                    "（院外のみ1.0／院内外どちらも=院外率/院内のみ0）。発行率・院外率は集客ベースと同値。")
 
     st.caption("※ サイドバーや面/門前を変えると、再検索なしで比較表・Excelが即更新されます。")
-
-
-# ── 保存／再読込（検索結果＋手修正をローカルに保存し、再起動しても復元） ────────────
-SAVE_FILE = os.path.join(os.path.dirname(__file__), "rx_session.json")
-_FAC_FIELDS = ["name", "address", "lat", "lon", "daily_outpatients", "weekly_op_days",
-               "rx_summary", "inhouse_rx", "outpatient_rx", "is_cosmetic",
-               "facility_category", "kikan_cd", "op_flag"]
-_PH_FIELDS = ["name", "address", "lat", "lon", "annual_rx_count", "kikan_cd"]
-
-
-def _mk_med(d):
-    return MedFacility(
-        name=d.get("name") or "", address=d.get("address") or "",
-        lat=d.get("lat"), lon=d.get("lon"),
-        daily_outpatients=d.get("daily_outpatients"), weekly_op_days=d.get("weekly_op_days"),
-        rx_summary=d.get("rx_summary") or "不明", inhouse_rx=d.get("inhouse_rx") or "—",
-        outpatient_rx=d.get("outpatient_rx") or "—", is_cosmetic=bool(d.get("is_cosmetic")),
-        facility_category=d.get("facility_category") or "診療所",
-        kikan_cd=d.get("kikan_cd") or "", op_flag=d.get("op_flag") or "")
-
-
-def _mk_ph(d):
-    return PharmacyFacility(
-        name=d.get("name") or "", address=d.get("address") or "",
-        lat=d.get("lat"), lon=d.get("lon"),
-        annual_rx_count=d.get("annual_rx_count"), kikan_cd=d.get("kikan_cd") or "")
-
-
-def _build_state():
-    raws = st.session_state.get("multi_raw", [])
-    return {
-        "candidates": [{
-            "label": r["label"], "name": r["name"], "addr": r["addr"],
-            "uni": r["uni"], "exposure": r.get("exposure", 1.0),
-            "clat": r["clat"], "clon": r["clon"],
-            "med": [{k: getattr(f, k, None) for k in _FAC_FIELDS} for f in r["med"]],
-            "ph": [{k: getattr(p, k, None) for k in _PH_FIELDS} for p in r["ph"]],
-        } for r in raws],
-        "med_edit": st.session_state.get("med_edit", {}),
-        "ph_edit": st.session_state.get("ph_edit", {}),
-        "mk_multi": st.session_state.get("mk_multi", {}),
-        "exp_multi": st.session_state.get("exp_multi", {}),
-    }
-
-
-def _apply_state(state):
-    raws = []
-    for c in state.get("candidates", []):
-        raws.append({"label": c["label"], "name": c["name"], "addr": c["addr"],
-                     "uni": c["uni"], "exposure": c.get("exposure", 1.0),
-                     "clat": c["clat"], "clon": c["clon"],
-                     "med": [_mk_med(d) for d in c["med"]],
-                     "ph": [_mk_ph(d) for d in c["ph"]]})
-    st.session_state["multi_raw"] = raws
-    for k in ("med_edit", "ph_edit", "mk_multi", "exp_multi"):
-        st.session_state[k] = state.get(k, {})
-
-
-def state_bytes():
-    return json.dumps(_build_state(), ensure_ascii=False).encode("utf-8")
-
-
-def save_session():
-    with open(SAVE_FILE, "w", encoding="utf-8") as fh:
-        json.dump(_build_state(), fh, ensure_ascii=False)
-
-
-def load_session():
-    with open(SAVE_FILE, encoding="utf-8") as fh:
-        _apply_state(json.load(fh))
 
 
 def make_fp(uni):
@@ -750,62 +679,10 @@ if col_clear.button("🗑 結果をクリア", use_container_width=True):
     for k in ("mk_multi", "exp_multi", "med_edit", "ph_edit"):
         st.session_state[k] = {}
     st.session_state["multi_raw"] = []
-    if os.path.exists(SAVE_FILE):
-        try:
-            os.remove(SAVE_FILE)
-        except OSError:
-            pass
     st.rerun()
-st.caption("※ 分析は**1店ずつ完了と同時に保存**されます。途中で止まっても完了分は残り、もう一度押せば"
-           "**続きから**処理します。3店同時＋全件取得ONは長時間になり中断されやすいので、"
-           "**うまくいかない時は1〜2店ずつ、または全件取得をOFF**にしてお試しください。")
-
-# 保存／再読込（検索や手修正の結果を残す。アプリを再起動しても復元）
-col_save, col_load = st.columns(2)
-if col_save.button("💾 現在の結果を保存（再検索不要に）", use_container_width=True,
-                   disabled=not st.session_state.get("multi_raw")):
-    try:
-        save_session()
-        st.success("保存しました。次回起動時に自動で復元されます（手動は『📂 保存を読込』）。")
-    except Exception as e:
-        st.error(f"保存に失敗: {e}")
-if col_load.button("📂 保存を読込", use_container_width=True, disabled=not os.path.exists(SAVE_FILE)):
-    try:
-        load_session()
-        st.rerun()
-    except Exception as e:
-        st.error(f"読込に失敗: {e}")
-
-with st.expander("🔁 ファイルで保存／復元（URL共有・複数人・持ち運び用）", expanded=False):
-    st.caption("上の『💾保存』はこのPC内に保存する方式で、**あなた一人のローカル利用向け**です。"
-               "**URLを他の人に配って使う場合**は、各自が下のボタンで**自分のPCにダウンロード**し、"
-               "使うときに**アップロードして復元**してください（他人と混ざらず、サーバー再起動でも消えません）。")
-    dc1, dc2 = st.columns(2)
-    dc1.download_button(
-        "⬇️ 保存ファイルをダウンロード", data=(state_bytes() if st.session_state.get("multi_raw") else b"{}"),
-        file_name="処方箋予測_保存.json", mime="application/json",
-        use_container_width=True, disabled=not st.session_state.get("multi_raw"))
-    up = dc2.file_uploader("⬆️ 保存ファイルから復元（アップロード）", type=["json"], key="restore_up")
-    if up is not None:
-        sig = (up.name, up.size)
-        if st.session_state.get("_last_up") != sig:
-            st.session_state["_last_up"] = sig
-            try:
-                _apply_state(json.loads(up.getvalue().decode("utf-8")))
-                st.success("復元しました。")
-                st.rerun()
-            except Exception as e:
-                st.error(f"復元に失敗: {e}")
-
-# 起動時に一度だけ、前回保存を自動復元（消えても再検索しなくて済む）
-if "auto_loaded" not in st.session_state:
-    st.session_state["auto_loaded"] = True
-    if not st.session_state.get("multi_raw") and os.path.exists(SAVE_FILE):
-        try:
-            load_session()
-            st.info("前回の保存を復元しました（クリアしたい場合は『🗑 結果をクリア』）。")
-        except Exception:
-            pass
+st.caption("※ 分析は**1店ずつ順に処理**します。もう一度押せば**未分析の店だけ続きから**処理します。"
+           "**1店ずつ分析 →「4. 数式入りExcel」でダウンロードして管理**するのがおすすめです"
+           "（3店同時＋全件取得ONは長時間になり中断されやすいため）。")
 
 if run:
     scraper = get_scraper()
@@ -853,10 +730,6 @@ if run:
                 "clat": clat, "clon": clon, "med": med, "ph": ph})
         overall.progress(1.0, text="完了")
         overall.empty()
-        try:
-            save_session()  # 検索完了時に自動保存（消えても再検索不要）
-        except Exception:
-            pass
         st.rerun()
 
 
