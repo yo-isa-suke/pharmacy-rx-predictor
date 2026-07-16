@@ -94,7 +94,67 @@ def _recs_sig(recs, numfield):
     return out
 
 
-def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon):
+_EXT_CATS = ["院外のみ", "院内外どちらも", "院内のみ", "不明"]
+
+
+def rx_category(fac):
+    """ナビィの院内/院外処方フィールドから、院外のみ/院内外どちらも/院内のみ/不明を判定。"""
+    ih = (getattr(fac, "inhouse_rx", "") or "")
+    op = (getattr(fac, "outpatient_rx", "") or "")
+    has_in, has_out = ("有" in ih), ("有" in op)
+    if has_out and has_in:
+        return "院内外どちらも"
+    if has_out and not has_in:
+        return "院外のみ"
+    if has_in and not has_out:
+        return "院内のみ"
+    s = getattr(fac, "rx_summary", "") or ""
+    if s.startswith("院外処方あり"):
+        return "院内外どちらも"
+    if s == "院内処方のみ":
+        return "院内のみ"
+    return "不明"
+
+
+def ext_coef(cat, ext_rate):
+    """院外区分→院外係数。院外のみ=1.0／院内外どちらも・不明=院外率／院内のみ=0。"""
+    if cat == "院外のみ":
+        return 1.0
+    if cat == "院内のみ":
+        return 0.0
+    return ext_rate
+
+
+def clinic_pool(fac, cat, a, issue_rate, ext_rate, unknown_op):
+    """クリニックの年間院外処方（原資）＝外来×診療日数×発行率×院外係数（美容/歯科は減係数）。"""
+    op = fac.daily_outpatients
+    if not op:
+        op = unknown_op  # 外来不明→既定値（下目）
+    days = (fac.weekly_op_days * 52.0
+            if (a.annual_days_mode == "weekly" and fac.weekly_op_days) else float(a.fixed_annual_days))
+    coef = ext_coef(cat, ext_rate)
+    if getattr(fac, "is_cosmetic", False):
+        coef *= a.cosmetic_factor
+    elif getattr(fac, "facility_category", "") == "歯科診療所":
+        coef *= a.dental_factor
+    return op * days * issue_rate * coef
+
+
+def clinic_flag(fac, high_thr):
+    """外れ値・不明のアラート文字列（空=正常）。"""
+    flags = []
+    op = fac.daily_outpatients
+    if not op:
+        flags.append("外来不明→既定値使用")
+    elif getattr(fac, "facility_category", "") != "病院" and op >= high_thr:
+        flags.append(f"要確認：{int(op)}人/日は多め")
+    cf = getattr(fac, "op_flag", "") or ""
+    if cf:
+        flags.append(cf)
+    return " / ".join(flags)
+
+
+def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon, cat_col=None):
     """
     編集後の data_editor 内容を、保存用レコードに解決する。行ごとに：
       ・緯度/経度を編集した → その座標を採用
@@ -126,7 +186,11 @@ def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon):
             if (lat is None or lon is None) and dist is not None and dist > 0:
                 lat, lon = clat + dist / 111000.0, clon  # 新規・距離のみ→真北に仮置き
         if name or (lat is not None and lon is not None):
-            out.append({"name": name, "lat": lat, "lon": lon, num_store: nv, "_key": key})
+            rec = {"name": name, "lat": lat, "lon": lon, num_store: nv, "_key": key}
+            if cat_col:
+                cv = row.get(cat_col)
+                rec["cat"] = cv if cv in _EXT_CATS else "不明"
+            out.append(rec)
     return out
 
 
@@ -139,7 +203,8 @@ def effective_facilities(raw, clat, clon, label):
     ph_edit = st.session_state.setdefault("ph_edit", {})
     if label not in med_edit:
         med_edit[label] = [{"name": f.name, "lat": f.lat, "lon": f.lon,
-                            "op": f.daily_outpatients, "_key": facility_key(f)} for f in raw["med"]]
+                            "op": f.daily_outpatients, "cat": rx_category(f),
+                            "_key": facility_key(f)} for f in raw["med"]]
     if label not in ph_edit:
         ph_edit[label] = [{"name": p.name, "lat": p.lat, "lon": p.lon,
                            "rx": p.annual_rx_count, "_key": pharmacy_key(p)} for p in raw["ph"]]
@@ -162,6 +227,8 @@ def effective_facilities(raw, clat, clon, label):
                             daily_outpatients=(int(op) if op else None),
                             rx_summary="院外処方あり", facility_category="診療所",
                             source="手動追加")
+        cat = r.get("cat")
+        f.rx_cat = cat if cat in _EXT_CATS else rx_category(f)
         f.distance_m = haversine(clat, clon, lat, lon)
         med_eff.append(f)
 
@@ -223,12 +290,19 @@ with st.sidebar:
                                 help="最寄りクリニックがこの距離以内の薬局は門前として自動判定→面競合から除外。")
     ff_decay = c7.number_input("面競合の距離減衰λ(m)", 0, 3000, 1000, 100,
                                help="遠い面競合を弱く数える。小さいほど自店シェア↑。")
-    ff_main = st.number_input("メイン薬局しきい値(枚/年)", 0, 100000, 15000, 1000,
-                              help="実績がこの値以上の薬局は面競合から除外。0で無効。")
+    ff_main = st.number_input(
+        "メイン薬局しきい値(枚/年・0=無効/既定)", 0, 100000, 0, 1000,
+        help="既定0＝無効。実績が大きい面薬局は“面の強豪”なので、除外せずパワー加重で強い競合として"
+             "数えます（門前かどうかは距離＝門前しきい値で判定）。門前で大量の店だけ外したい場合のみ値を入れます。",
+    )
 
     with st.expander("⚙️ 詳細設定（ハフ按分・通常は変更不要）", expanded=False):
-        huff_lambda = st.slider("距離減衰 λ (m)", 150, 900, 250, 50)
-        huff_boost = st.slider("門前ブースト", 1.0, 15.0, 8.0, 0.5)
+        huff_lambda = st.slider(
+            "距離減衰 λ (m)", 150, 1200, 300, 50,
+            help="発行率×院外係数を入れた新原資に合わせ、地方69シード・面型106店で再較正した値"
+                 "（予測/実績 中央値0.99）。",
+        )
+        huff_boost = st.slider("門前ブースト", 1.0, 15.0, 6.0, 0.5)
         huff_monzen_r = st.slider(
             "門前ブースト半径 (m)", 30, 150, 50, 10,
             help="①医療機関ベースで、クリニックからこの距離以内の薬局に門前ブーストを掛けます。"
@@ -236,6 +310,17 @@ with st.sidebar:
                  "広げた場合は再較正が望ましい）。",
         )
         huff_candA = st.number_input("候補店の引力（大型店は上げる）", 0.2, 10.0, 1.0, 0.1)
+        st.caption("── 医療機関ベースの原資（外来→処方箋の換算）──")
+        med_unknown_op = st.number_input(
+            "外来不明クリニックの既定外来数(人/日)", 0, 500, 30, 5,
+            help="ナビィで外来患者数が取得できないクリニックに入れる値（未入力なので下目に設定）。",
+        )
+        med_high_thr = st.number_input(
+            "外れ値アラートしきい値（診療所・人/日）", 50, 2000, 200, 10,
+            help="診療所でこの人数以上なら『要確認』を表示（月間値・誤登録の疑い）。",
+        )
+        st.caption(f"※ 原資 = 外来×診療日数×発行率{float(ff_issue):.4f}×院外係数"
+                   "（院外のみ1.0／院内外どちらも=院外率/院内のみ0）。発行率・院外率は集客ベースと同値。")
 
     st.caption("※ サイドバーや面/門前を変えると、再検索なしで比較表・Excelが即更新されます。")
 
@@ -257,8 +342,7 @@ def make_hp():
 
 
 # ── ハフの取り分内訳（クリニック1行ずつ・自店の重み/競合の重み合計を明示） ─────────
-def huff_breakdown(med, ph, clat, clon, hp, a, op_override=None):
-    op_override = op_override or {}
+def huff_breakdown(med, ph, clat, clon, hp, a, issue_rate, ext_rate, unknown_op):
     comps = []
     for p in ph:
         if p.lat is None or p.lon is None:
@@ -279,7 +363,8 @@ def huff_breakdown(med, ph, clat, clon, hp, a, op_override=None):
         d_self = haversine(clat, clon, f.lat, f.lon)
         if d_self > hp.reach_m:
             continue
-        pool = _clinic_annual_rx_pool(f, a, op_override)
+        cat = getattr(f, "rx_cat", None) or rx_category(f)
+        pool = clinic_pool(f, cat, a, issue_rate, ext_rate, unknown_op)
         if pool <= 0:
             continue
         self_w = bw(d_self, hp.candidate_attractiveness)
@@ -308,7 +393,8 @@ def compute_candidate(raw):
     exposure = float(st.session_state.get("exp_multi", {}).get(label, raw.get("exposure", 1.0)))
     eff_uni = uni * exposure
     fp = make_fp(eff_uni)
-    hb = huff_breakdown(med, ph, clat, clon, hp, a)
+    hb = huff_breakdown(med, ph, clat, clon, hp, a,
+                        float(ff_issue), float(ff_ext), float(med_unknown_op))
     med_total = sum(r["captured"] for r in hb)
     classified = classify_menkata(ph, med, clat, clon,
                                   monzen_dist=fp.menkata_monzen_dist,
@@ -705,34 +791,48 @@ if raws:
         "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
     })
 
-    with st.expander("🔧 医療機関の確認・修正（座標補正／外来数／漏れの追加・削除 → ①に反映）", expanded=False):
+    med_flags = [clinic_flag(f, int(med_high_thr)) for f in c["med"]]
+    n_alert = sum(1 for x in med_flags if x)
+    if n_alert:
+        st.warning(f"⚠️ 医療機関に **{n_alert}件** の要確認あり（外れ値/外来不明）。下の表『検証』列を確認し、"
+                   "外来数・院外区分・座標を必要に応じて修正してください。")
+    with st.expander("🔧 医療機関の確認・修正（座標／外来数／院外区分／漏れの追加・削除 → ①に反映）", expanded=bool(n_alert)):
         st.caption(
-            "『距離(m)』が実態と大きく違う施設は、座標(緯度・経度)がズレています。"
-            "Googleマップの正しい座標を緯度・経度に入れると距離が再計算され①に反映されます"
-            "（距離(m)を直接入力しても補正可＝向きは元のまま／最も正確なのは緯度経度）。"
-            "行を追加すれば漏れたクリニックを足せます。行を削除すれば誤検出を外せます。"
+            "『距離(m)』が実態と違う施設は座標がズレています（緯度経度を直すのが最も正確／距離を直接入力も可）。"
+            "『院外区分』は院外のみ=100%・院内外どちらも=院外率・院内のみ=0で原資に反映（手で修正可）。"
+            "『外来(人/日)』が不明のクリニックは既定値を使用（下の警告参照）。行の追加/削除で漏れ・誤検出を補正。"
         )
         med_edit = st.session_state.setdefault("med_edit", {})
         recs = med_edit.get(sel, [])
+        fmap = {facility_key(f): fl for f, fl in zip(c["med"], med_flags)}
         disp = pd.DataFrame([{
             "医療機関": r.get("name"),
             "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
                        if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
             "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
-            "外来(人/日)": r.get("op"), "_key": r.get("_key"),
+            "外来(人/日)": r.get("op"),
+            "院外区分": (r.get("cat") if r.get("cat") in _EXT_CATS else "不明"),
+            "検証": fmap.get(r.get("_key"), (
+                "外来不明→既定使用" if _num(r.get("op")) is None else
+                (f"要確認：{int(_num(r.get('op')))}人/日" if _num(r.get("op")) >= med_high_thr else ""))),
+            "_key": r.get("_key"),
         } for r in recs])
         ed = st.data_editor(
             disp, hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"med_edit_{sel}", disabled=["_key"],
+            key=f"med_edit_{sel}", disabled=["検証", "_key"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
-                "距離(m)": st.column_config.NumberColumn("距離(m)", help="ここに正しい距離を直接入力しても補正できます（向きは保持）。最も正確なのは緯度経度の修正。"),
+                "距離(m)": st.column_config.NumberColumn("距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
                 "外来(人/日)": st.column_config.NumberColumn("外来(人/日)", min_value=0, step=1),
+                "院外区分": st.column_config.SelectboxColumn("院外区分", options=_EXT_CATS, width="medium"),
             },
         )
-        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"])
-        if _recs_sig(new_recs, "op") != _recs_sig(recs, "op"):
+        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
+                                cat_col="院外区分")
+        changed = (_recs_sig(new_recs, "op") != _recs_sig(recs, "op")
+                   or [r.get("cat") for r in new_recs] != [r.get("cat") for r in recs])
+        if changed:
             med_edit[sel] = new_recs
             st.rerun()
 
