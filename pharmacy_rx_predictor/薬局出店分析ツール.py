@@ -2403,41 +2403,42 @@ def eff_issue_rate(dept, override, dept_rates):
     return dept_rates.get(dept, DEFAULT_ISSUE)
 
 
-# ── 診療（営業）曜日・時間の抽出（ナビィ詳細ページの raw_fields から） ─────────────────
+# ── 診療（開局）曜日・時間の抽出（ナビィ詳細ページの raw_fields から） ─────────────────
+# ナビィは月〜日＋祝の8列を "/" 連結した時間割を持つ。医療機関＝「診療時間（診療科目別の）…」、
+# 薬局＝「時間帯１」。曜日・時間は必ずこの8列時間割から index で導出する
+# （"営業日""診療日" 等の直接キーは、他項目やツールチップ文言への部分一致で誤取得するため使わない）。
 _WEEK_LABELS = ["月", "火", "水", "木", "金", "土", "日", "祝"]
-_OPEN_DAY_KEYS = ["診療日", "外来診療日", "診療曜日", "診療を行う日", "営業日", "開局日", "開店日"]
-_OPEN_HOUR_KEYS = [
-    "診療時間（診療科目別の）", "外来受付時間（診療科目別の）", "診療時間帯",
-    "診療時間", "外来受付時間", "受付時間",
-    "開局時間", "営業時間", "開店時間", "薬局の開局時間", "開局曜日・時間",
+_SCHEDULE_KEYS = [
+    "時間帯１", "時間帯1",                 # 薬局（開局時間）
+    "診療時間（診療科目別の）",             # 医療機関（診療科目別の診療時間）
+    "外来受付時間（診療科目別の）",         # 医療機関（外来受付時間）
 ]
 
 
 def parse_open_schedule(fields):
-    """raw_fields から (曜日, 時間) の表示用文字列を作る。取得できなければ ("", "")。
-    ナビィの診療時間表（月〜日/祝の8列を"/"連結）から開いている曜日と代表時間を推定する。"""
+    """raw_fields から (開いている曜日, 代表的な時間帯) を作る。取得できなければ ("", "")。
+    例: 内山皮膚科→("月火水金土","09:00-12:00") / マルヤマ薬局→("月火水木金土","09:00-19:00")。"""
     if not fields:
         return "", ""
-    days_str, hours_str = "", ""
-    dv = _get_field(fields, _OPEN_DAY_KEYS)
-    if dv:
-        days_str = re.sub(r"\s+", " ", dv).strip()[:40]
-    sv = _get_field(fields, _OPEN_HOUR_KEYS)
-    if sv:
-        parts = [p.strip() for p in sv.split("/")]
-        if len(parts) >= 7:  # 月..日(祝) の曜日別テーブル
-            open_days, times = [], []
-            for i, p in enumerate(parts[:8]):
-                if p and re.search(r"\d{1,2}:\d{2}", p):
-                    if i < len(_WEEK_LABELS):
-                        open_days.append(_WEEK_LABELS[i])
-                    times.append(re.sub(r"\s+", " ", p))
-            if open_days and not days_str:
-                days_str = "".join(open_days)
-            if times:
-                hours_str = max(set(times), key=times.count)[:40]  # 代表＝最頻の時間帯
-        else:
-            hours_str = re.sub(r"\s+", " ", sv).strip()[:60]
+    sv = None
+    for key in _SCHEDULE_KEYS:                 # 8列の時間割フィールドを探す
+        for fk, fv in fields.items():
+            if key in fk and "/" in fv and re.search(r"\d{1,2}:\d{2}", fv):
+                sv = fv
+                break
+        if sv:
+            break
+    if not sv:
+        return "", ""
+    parts = [p.strip() for p in sv.split("/")]
+    open_days, times = [], []
+    for i, p in enumerate(parts[:8]):          # 0..7 = 月火水木金土日祝
+        if p and re.search(r"\d{1,2}:\d{2}", p):
+            if i < len(_WEEK_LABELS):
+                open_days.append(_WEEK_LABELS[i])
+            times.append(re.sub(r"\s+", "", p))
+    days_str = "".join(open_days)
+    hours_str = max(set(times), key=times.count) if times else ""   # 代表＝最頻の時間帯
     return days_str, hours_str
 
 
@@ -2848,7 +2849,7 @@ def build_map(c, radius_m):
         is_men = menkata.get(pharmacy_key(p), True)
         rx = p.annual_rx_count
         days, hours = parse_open_schedule(getattr(p, "raw_fields", None))
-        sched = (f"<br>営業日: {days}" if days else "") + (f"<br>営業時間: {hours}" if hours else "")
+        sched = (f"<br>開局日: {days}" if days else "") + (f"<br>開局時間: {hours}" if hours else "")
         html = (f"<b>{p.name}</b><br>距離 {d}m<br>"
                 f"区分: {'面' if is_men else '門前'}<br>"
                 f"実績: {int(rx) if rx else '—'} 枚/年{sched}")
@@ -3333,14 +3334,14 @@ if raws:
                                 if (r.get("_key") in clmap and clmap[r.get("_key")]["nearest_clinic"] < 1e8) else None),
             "面/門前": ("面" if mk.get(r.get("_key"),
                        (clmap[r.get("_key")]["auto_menkata"] if r.get("_key") in clmap else True)) else "門前"),
-            "営業日": psched_map.get(r.get("_key"), ("", ""))[0],
-            "営業時間": psched_map.get(r.get("_key"), ("", ""))[1],
+            "開局日": psched_map.get(r.get("_key"), ("", ""))[0],
+            "開局時間": psched_map.get(r.get("_key"), ("", ""))[1],
             "_key": r.get("_key"),
         } for r in precs])
         ped = st.data_editor(
             pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
             key=f"ph_edit_{sel}",
-            disabled=["距離(m)", "最寄りクリニック(m)", "_key", "営業日", "営業時間"],
+            disabled=["距離(m)", "最寄りクリニック(m)", "_key", "開局日", "開局時間"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
@@ -3348,8 +3349,8 @@ if raws:
                 "実績(枚/年)": st.column_config.NumberColumn("実績(枚/年)", min_value=0, step=100),
                 "面/門前": st.column_config.SelectboxColumn("面/門前", options=["面", "門前"], width="small",
                                                        help="面＝集客の競合に数える／門前＝競合から外す"),
-                "営業日": st.column_config.TextColumn("営業日", help="ナビィの開局時間表から抽出（開いている曜日）。"),
-                "営業時間": st.column_config.TextColumn("営業時間", help="ナビィの開局時間表から抽出（代表的な時間帯）。"),
+                "開局日": st.column_config.TextColumn("開局日", help="ナビィの開局時間表から抽出（開いている曜日）。"),
+                "開局時間": st.column_config.TextColumn("開局時間", help="ナビィの開局時間表から抽出（代表的な時間帯）。"),
             },
         )
         pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
