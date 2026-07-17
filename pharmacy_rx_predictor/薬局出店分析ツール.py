@@ -2377,15 +2377,21 @@ def _recs_sig(recs, numfield):
 _EXT_CATS = ["院外のみ", "院内外どちらも", "院内のみ", "不明"]
 
 # ── 診療科別の処方箋発行率（＝そもそも処方箋を出す割合。院外率とは別物） ──────────────
-# 根拠: 院外“処方率”は厚労省・社会医療診療行為別統計で全体81.4%（＝院外率0.8313に反映済）。
-# 一方、受診のうち投薬に至る割合（発行率）は診療科で大きく異なる。整形外科はリハ・処置・注射
-# 中心で投薬なしの受診が多い等。公表統計に一覧値は無いため、臨床実態からの“大まかな初期値”とし、
-# 画面（サイドバー＝科ごと・医療機関表＝施設ごと）で編集できる設計にしている。
+# 【根拠】
+#  ・院外“処方率”は厚労省・社会医療診療行為別統計 令和6年で全体81.4%（＝院外率0.8313に反映済）。
+#  ・受診のうち投薬に至る割合（発行率）の診療科差は、日医総研RR113「診療所の診療科特性」表5.3.1
+#    （厚労省 社会医療診療行為別統計より作成）の“診療科別・入院外・投薬の点数構成比(2020)”で裏づけ：
+#      内科20.4% 皮膚22.0% 産婦21.1% 外科16.3% 精神15.1% 耳鼻14.9% 泌尿14.8% 整形12.8% 眼科11.8% 小児11.1%
+#    整形外科は投薬が低く代わりに「その他(リハビリ等)」28.8%・画像13.4%、眼科は検査43.6%＋手術20.0%が主体。
+#  ・ただし点数構成比は“収益の内訳”で発行「頻度」とは別物（小児=医学管理料主体/精神=精神療法主体で
+#    点数は低いが投薬頻度は高い）。そこで点数構成比を方向性の根拠とし、臨床実態で補正した初期値とした。
+#  ・下表の件数加重平均は約0.803で、再較正時のフラット値0.8054とほぼ一致（＝全体水準は保ちつつ科別に再配分）。
+#  ・値はサイドバー（科ごと）・医療機関表（施設ごと）で編集可能。
 DEFAULT_ISSUE = 0.8054  # その他・不明・大病院はこの一律値（従来値）
 DEPT_DEFAULTS = [
     ("内科系", 0.90), ("精神科", 0.92), ("小児科", 0.88), ("耳鼻咽喉科", 0.85),
-    ("皮膚科", 0.80), ("泌尿器科", 0.80), ("産婦人科", 0.60), ("眼科", 0.65),
-    ("整形外科", 0.55), ("外科", 0.55), ("リハビリ科", 0.20), ("美容", 0.00),
+    ("皮膚科", 0.85), ("泌尿器科", 0.75), ("産婦人科", 0.60), ("眼科", 0.65),
+    ("整形外科", 0.55), ("外科", 0.60), ("リハビリ科", 0.20), ("美容", 0.00),
     ("病院", DEFAULT_ISSUE), ("その他", DEFAULT_ISSUE),
 ]
 DEPT_OPTIONS = [k for k, _ in DEPT_DEFAULTS]
@@ -2442,6 +2448,44 @@ def eff_issue_rate(dept, override, dept_rates):
     if override is not None:
         return override
     return dept_rates.get(dept, DEFAULT_ISSUE)
+
+
+# ── 診療（営業）曜日・時間の抽出（ナビィ詳細ページの raw_fields から） ─────────────────
+_WEEK_LABELS = ["月", "火", "水", "木", "金", "土", "日", "祝"]
+_OPEN_DAY_KEYS = ["診療日", "外来診療日", "診療曜日", "診療を行う日", "営業日", "開局日", "開店日"]
+_OPEN_HOUR_KEYS = [
+    "診療時間（診療科目別の）", "外来受付時間（診療科目別の）", "診療時間帯",
+    "診療時間", "外来受付時間", "受付時間",
+    "開局時間", "営業時間", "開店時間", "薬局の開局時間", "開局曜日・時間",
+]
+
+
+def parse_open_schedule(fields):
+    """raw_fields から (曜日, 時間) の表示用文字列を作る。取得できなければ ("", "")。
+    ナビィの診療時間表（月〜日/祝の8列を"/"連結）から開いている曜日と代表時間を推定する。"""
+    if not fields:
+        return "", ""
+    days_str, hours_str = "", ""
+    dv = _get_field(fields, _OPEN_DAY_KEYS)
+    if dv:
+        days_str = re.sub(r"\s+", " ", dv).strip()[:40]
+    sv = _get_field(fields, _OPEN_HOUR_KEYS)
+    if sv:
+        parts = [p.strip() for p in sv.split("/")]
+        if len(parts) >= 7:  # 月..日(祝) の曜日別テーブル
+            open_days, times = [], []
+            for i, p in enumerate(parts[:8]):
+                if p and re.search(r"\d{1,2}:\d{2}", p):
+                    if i < len(_WEEK_LABELS):
+                        open_days.append(_WEEK_LABELS[i])
+                    times.append(re.sub(r"\s+", " ", p))
+            if open_days and not days_str:
+                days_str = "".join(open_days)
+            if times:
+                hours_str = max(set(times), key=times.count)[:40]  # 代表＝最頻の時間帯
+        else:
+            hours_str = re.sub(r"\s+", " ", sv).strip()[:60]
+    return days_str, hours_str
 
 
 def rx_category(fac):
@@ -2703,6 +2747,9 @@ with st.sidebar:
             st.rerun()
         st.caption("整形外科0.55/リハビリ0.20/内科系0.90 等（受診のうち投薬に至る割合）。"
                    "診療科は施設ごとに医療機関表でも変更できます。大病院は一律で『病院』値。")
+        st.caption("根拠：日医総研 診療所の診療科特性（厚労省 社会医療診療行為別統計より作成）の"
+                   "診療科別・入院外・投薬の点数構成比（2020）＝内科20.4%/皮膚22.0%/整形12.8%/眼科11.8% 等。"
+                   "件数加重平均≒0.80で全体水準は較正値と整合。")
         st.caption("※ ①の原資 = 外来×診療日数×**診療科別発行率**×院外係数"
                    "（院外のみ1.0／院内外どちらも=院外率/院内のみ0）。"
                    f"②集客ベースの発行率は上の {float(ff_issue):.4f}（館全体の平均）を使用。")
@@ -2829,11 +2876,13 @@ def build_map(c, radius_m):
             continue
         d = round(haversine(clat, clon, f.lat, f.lon))
         op = f.daily_outpatients
+        days, hours = parse_open_schedule(getattr(f, "raw_fields", None))
+        sched = (f"<br>診療日: {days}" if days else "") + (f"<br>診療時間: {hours}" if hours else "")
         html = (f"<b>{f.name}</b><br>距離 {d}m<br>"
                 f"診療科: {getattr(f, 'dept_name', '—')}"
                 f"（発行率 {getattr(f, 'issue_eff', 0.0):.2f}）<br>"
                 f"外来: {int(op) if op else '不明'} 人/日<br>"
-                f"院外区分: {getattr(f, 'rx_cat', '—')}")
+                f"院外区分: {getattr(f, 'rx_cat', '—')}{sched}")
         folium.Marker([f.lat, f.lon], tooltip=f.name,
                       popup=folium.Popup(html, max_width=280),
                       icon=folium.Icon(color=_med_color(f), icon="plus", prefix="fa")).add_to(m)
@@ -2846,9 +2895,11 @@ def build_map(c, radius_m):
         d = round(haversine(clat, clon, p.lat, p.lon))
         is_men = menkata.get(pharmacy_key(p), True)
         rx = p.annual_rx_count
+        days, hours = parse_open_schedule(getattr(p, "raw_fields", None))
+        sched = (f"<br>営業日: {days}" if days else "") + (f"<br>営業時間: {hours}" if hours else "")
         html = (f"<b>{p.name}</b><br>距離 {d}m<br>"
                 f"区分: {'面' if is_men else '門前'}<br>"
-                f"実績: {int(rx) if rx else '—'} 枚/年")
+                f"実績: {int(rx) if rx else '—'} 枚/年{sched}")
         folium.Marker([p.lat, p.lon], tooltip=p.name,
                       popup=folium.Popup(html, max_width=250),
                       icon=folium.Icon(color=("green" if is_men else "orange"),
@@ -3101,12 +3152,6 @@ def build_excel(results):
 
 # ════════════════════════════════ メイン ════════════════════════════════
 st.title("🏪 薬局 出店候補地 分析ツール")
-st.caption(
-    "同じスーパーの複数の出店候補地（A / B / C…）をまとめて分析し、2トラック"
-    "（① 医療機関ベース × ② 集客ベース）で比較します。分析結果には周辺の医療機関・薬局を示した"
-    "**商圏マップ**を表示（スクショでお客様提示可）。処方箋の**発行率は診療科別**に反映します。"
-    "ロジックの内訳はブラウザで確認でき、数式入りExcelにも書き出せます。"
-)
 
 st.markdown("#### 1. 候補地を入力")
 st.caption("候補地ごとに ラベル・店舗名/メモ・住所・月間ユニーク客数（集客ベース用）を入力してください。行は追加できます。")
@@ -3277,6 +3322,8 @@ if raws:
         recs = med_edit.get(sel, [])
         dr = get_dept_rates()
         fmap = {facility_key(f): fl for f, fl in zip(c["med"], med_flags)}
+        sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
+                     for f in c["med"]}
 
         def _disp_dept(r):
             d = r.get("dept")
@@ -3291,6 +3338,8 @@ if raws:
             "院外区分": (r.get("cat") if r.get("cat") in _EXT_CATS else "不明"),
             "診療科": _disp_dept(r),
             "発行率": eff_issue_rate(_disp_dept(r), _num(r.get("issue")), dr),
+            "診療日": sched_map.get(r.get("_key"), ("", ""))[0],
+            "診療時間": sched_map.get(r.get("_key"), ("", ""))[1],
             "検証": fmap.get(r.get("_key"), (
                 "外来不明→既定使用" if _num(r.get("op")) is None else
                 (f"要確認：{int(_num(r.get('op')))}人/日" if _num(r.get("op")) >= med_high_thr else ""))),
@@ -3298,13 +3347,15 @@ if raws:
         } for r in recs])
         ed = st.data_editor(
             disp, hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"med_edit_{sel}", disabled=["検証", "_key"],
+            key=f"med_edit_{sel}", disabled=["検証", "_key", "診療日", "診療時間"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
                 "距離(m)": st.column_config.NumberColumn("距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
                 "外来(人/日)": st.column_config.NumberColumn("外来(人/日)", min_value=0, step=1),
                 "院外区分": st.column_config.SelectboxColumn("院外区分", options=_EXT_CATS, width="medium"),
+                "診療日": st.column_config.TextColumn("診療日", help="ナビィの診療時間表から抽出（開いている曜日）。"),
+                "診療時間": st.column_config.TextColumn("診療時間", help="ナビィの診療時間表から抽出（代表的な時間帯）。"),
                 "診療科": st.column_config.SelectboxColumn(
                     "診療科", options=DEPT_OPTIONS, width="small",
                     help="標榜診療科から自動判定。変えると発行率がその科の初期値になります。"),
@@ -3373,6 +3424,8 @@ if raws:
         mk = mk_all.setdefault(sel, {})
         precs = ph_edit.get(sel, [])
         clmap = {r["key"]: r for r in c["classified"]}
+        psched_map = {pharmacy_key(p): parse_open_schedule(getattr(p, "raw_fields", None))
+                      for p in c["ph"]}
         pdisp = pd.DataFrame([{
             "薬局": r.get("name"),
             "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
@@ -3383,11 +3436,14 @@ if raws:
                                 if (r.get("_key") in clmap and clmap[r.get("_key")]["nearest_clinic"] < 1e8) else None),
             "面/門前": ("面" if mk.get(r.get("_key"),
                        (clmap[r.get("_key")]["auto_menkata"] if r.get("_key") in clmap else True)) else "門前"),
+            "営業日": psched_map.get(r.get("_key"), ("", ""))[0],
+            "営業時間": psched_map.get(r.get("_key"), ("", ""))[1],
             "_key": r.get("_key"),
         } for r in precs])
         ped = st.data_editor(
             pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"ph_edit_{sel}", disabled=["距離(m)", "最寄りクリニック(m)", "_key"],
+            key=f"ph_edit_{sel}",
+            disabled=["距離(m)", "最寄りクリニック(m)", "_key", "営業日", "営業時間"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
@@ -3395,6 +3451,8 @@ if raws:
                 "実績(枚/年)": st.column_config.NumberColumn("実績(枚/年)", min_value=0, step=100),
                 "面/門前": st.column_config.SelectboxColumn("面/門前", options=["面", "門前"], width="small",
                                                        help="面＝集客の競合に数える／門前＝競合から外す"),
+                "営業日": st.column_config.TextColumn("営業日", help="ナビィの開局時間表から抽出（開いている曜日）。"),
+                "営業時間": st.column_config.TextColumn("営業時間", help="ナビィの開局時間表から抽出（代表的な時間帯）。"),
             },
         )
         pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
