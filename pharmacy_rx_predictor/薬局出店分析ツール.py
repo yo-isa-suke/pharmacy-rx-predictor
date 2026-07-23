@@ -3194,53 +3194,25 @@ if run:
 
 
 # ── 結果の比較表示（毎回、現在の設定＋手修正で再計算） ──────────────────────────
-raws = st.session_state.get("multi_raw", [])
-if raws:
-    # 第1パス：編集フォームの表示を組み立てるための計算（前回までの手修正を反映）。
-    computed = [compute_candidate(r) for r in raws]
-
-    # 表示は「比較 → 詳細（メトリクス/マップ/内訳）」の順で見せたいが、手修正を即反映
-    # させるため、先に表示枠(container)だけ確保しておき、編集ウィジェットを処理した後に
-    # 最新値で中身を描画する。これにより st.rerun() 不要＝画面が先頭に飛ばず“さくさく”動く。
-    st.markdown("#### 2. 比較結果")
-    cmp_area = st.container()
-
-    st.markdown("#### 3. 候補地ごとの詳細（ロジックの内訳）")
-    sel = st.selectbox("詳細を見る候補地", [c["label"] for c in computed],
-                       format_func=lambda x: f"{x}　" + next((c["name"] or c["addr"][:16]
-                                                              for c in computed if c["label"] == x), ""))
-    detail_area = st.container()          # メトリクス／マップ／①内訳／②内訳（下で描画）
-    c = next(x for x in computed if x["label"] == sel)  # 第1パス（編集フォーム構築用）
-
-    # ═══ 編集フォーム（＝入力を先に処理。変更は session_state に保存し、st.rerun しない） ═══
-    st.markdown("##### 🔧 確認・修正（面/門前・座標・診療科・外来など）")
-    st.caption("ここでの変更は上の予測・マップに**その場で反映**されます（画面は先頭に戻りません）。")
-
-    # ② 集客ベースの周知率（入力を先に処理。内訳テキストは下の詳細エリアに表示）
-    if c["foot"]:
-        exp_all = st.session_state.setdefault("exp_multi", {})
-        new_exp = st.number_input(
-            f"周知率（{sel}）— 館の来店客のうち薬局に接触する割合", 0.0, 1.0,
-            float(c["exposure"]), 0.05, format="%.2f", key=f"exp_{sel}",
-            help="食品スーパー=1.0／大型モール1階・主動線=0.3／上層階・動線外=0.1。変更すると②が再計算されます。",
-        )
-        if abs(new_exp - c["exposure"]) > 1e-9:
-            exp_all[sel] = new_exp            # 保存のみ（st.rerunしない）
-
-    med_flags = [clinic_flag(f, int(med_high_thr)) for f in c["med"]]
+# ── 編集フォームは st.fragment で隔離：行追加・修正の間はアプリ全体を再実行しない ─────
+# （data_editorに確定行を毎回戻すと追加行が重複増殖して重くなるため、編集中は戻さず、
+#  「反映」ボタン押下時のみ確定＝session_stateへ保存し、ウィジェット状態をクリアして全体再計算）
+@st.fragment
+def render_med_editor(sel, c, med_high_thr_v):
+    dr = get_dept_rates()
+    med_flags = [clinic_flag(f, med_high_thr_v) for f in c["med"]]
     n_alert = sum(1 for x in med_flags if x)
     if n_alert:
-        st.warning(f"⚠️ 医療機関に **{n_alert}件** の要確認あり（外れ値/外来不明）。下の表『検証』列を確認し、"
+        st.warning(f"⚠️ 医療機関に **{n_alert}件** の要確認あり（外れ値/外来不明）。『検証』列を確認し、"
                    "外来数・院外区分・座標を必要に応じて修正してください。")
     with st.expander("🔧 医療機関の確認・修正（座標／外来数／院外区分／診療科／漏れの追加・削除 → ①に反映）", expanded=bool(n_alert)):
         st.caption(
             "『距離(m)』が実態と違う施設は座標がズレています（緯度経度を直すのが最も正確／距離を直接入力も可）。"
-            "『院外区分』は院外のみ=100%・院内外どちらも=院外率・院内のみ=0で原資に反映（手で修正可）。"
-            "『外来(人/日)』が不明のクリニックは既定値を使用（下の警告参照）。行の追加/削除で漏れ・誤検出を補正。"
+            "行を追加・修正・削除したら、最後に **「反映して再計算」** を押すと①予測・マップに反映されます"
+            "（編集中は全体を再計算しないので、続けて何行でもサクサク追加できます）。"
         )
         med_edit = st.session_state.setdefault("med_edit", {})
         recs = med_edit.get(sel, [])
-        dr = get_dept_rates()
         fmap = {facility_key(f): fl for f, fl in zip(c["med"], med_flags)}
         sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
                      for f in c["med"]}
@@ -3262,7 +3234,7 @@ if raws:
             "診療時間": sched_map.get(r.get("_key"), ("", ""))[1],
             "検証": fmap.get(r.get("_key"), (
                 "外来不明→既定使用" if _num(r.get("op")) is None else
-                (f"要確認：{int(_num(r.get('op')))}人/日" if _num(r.get("op")) >= med_high_thr else ""))),
+                (f"要確認：{int(_num(r.get('op')))}人/日" if _num(r.get("op")) >= med_high_thr_v else ""))),
             "_key": r.get("_key"),
         } for r in recs])
         ed = st.data_editor(
@@ -3284,38 +3256,39 @@ if raws:
                     help="この施設だけ発行率を手入力で上書きできます（受診のうち投薬に至る割合）。"),
             },
         )
-        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
-                                cat_col="院外区分", dept_col="診療科", issue_col="発行率")
-        old_map = {r.get("_key"): r for r in recs if r.get("_key")}
-        for nr in new_recs:
-            disp_iss = nr.pop("issue_disp", None)
-            old = old_map.get(nr.get("_key"))
-            old_dept = (old or {}).get("dept")
-            old_issue = (old or {}).get("issue")
-            old_eff = eff_issue_rate(
-                old_dept if old_dept in dr else (nr.get("dept") or "その他"), old_issue, dr)
-            ndept = nr.get("dept")
-            if ndept is not None and ndept != old_dept:
-                nr["issue"] = None                 # 診療科を変更→その科の初期値に従う
-                nr["dept"] = ndept
-            elif disp_iss is not None and abs(disp_iss - old_eff) > 1e-6:
-                nr["issue"] = disp_iss             # 発行率を手入力→この施設だけ上書き
-                nr["dept"] = old_dept or ndept or "その他"
-            else:
-                nr["issue"] = old_issue
-                nr["dept"] = old_dept or ndept or "その他"
-        changed = (_recs_sig(new_recs, "op") != _recs_sig(recs, "op")
-                   or [r.get("cat") for r in new_recs] != [r.get("cat") for r in recs]
-                   or [r.get("dept") for r in new_recs] != [r.get("dept") for r in recs]
-                   or [r.get("issue") for r in new_recs] != [r.get("issue") for r in recs])
-        if changed:
-            med_edit[sel] = new_recs             # 保存のみ（st.rerunしない）
+        if st.button("🔄 医療機関の修正を反映（再計算）", key=f"apply_med_{sel}", type="primary"):
+            new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
+                                    cat_col="院外区分", dept_col="診療科", issue_col="発行率")
+            old_map = {r.get("_key"): r for r in recs if r.get("_key")}
+            for nr in new_recs:
+                disp_iss = nr.pop("issue_disp", None)
+                old = old_map.get(nr.get("_key"))
+                old_dept = (old or {}).get("dept")
+                old_issue = (old or {}).get("issue")
+                old_eff = eff_issue_rate(
+                    old_dept if old_dept in dr else (nr.get("dept") or "その他"), old_issue, dr)
+                ndept = nr.get("dept")
+                if ndept is not None and ndept != old_dept:
+                    nr["issue"] = None                 # 診療科を変更→その科の初期値に従う
+                    nr["dept"] = ndept
+                elif disp_iss is not None and abs(disp_iss - old_eff) > 1e-6:
+                    nr["issue"] = disp_iss             # 発行率を手入力→この施設だけ上書き
+                    nr["dept"] = old_dept or ndept or "その他"
+                else:
+                    nr["issue"] = old_issue
+                    nr["dept"] = old_dept or ndept or "その他"
+            med_edit[sel] = new_recs
+            st.session_state.pop(f"med_edit_{sel}", None)   # ウィジェット状態をクリア＝追加行の重複増殖を防止
+            st.rerun(scope="app")
 
+
+@st.fragment
+def render_ph_editor(sel, c):
     with st.expander("🔧 薬局の確認・修正（座標／実績／面・門前／漏れの追加・削除 → ①②に反映）", expanded=False):
         st.caption(
             "座標(緯度・経度)がズレている薬局は正しい値に直し（距離(m)直接入力も可）、漏れている薬局は行追加、"
-            "誤検出は行削除。『面/門前』もここで修正でき、②の面競合に即反映されます"
-            "（『最寄りクリニック(m)』が近い店が門前の目安）。"
+            "誤検出は行削除。『面/門前』もここで修正できます。行を追加・修正したら、最後に "
+            "**「反映して再計算」** を押すと①②に反映されます（編集中は全体を再計算しません）。"
         )
         ph_edit = st.session_state.setdefault("ph_edit", {})
         mk_all = st.session_state.setdefault("mk_multi", {})
@@ -3353,91 +3326,124 @@ if raws:
                 "開局時間": st.column_config.TextColumn("開局時間", help="ナビィの開局時間表から抽出（代表的な時間帯）。"),
             },
         )
-        pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
-        auto_men = {r["key"]: r["auto_menkata"] for r in c["classified"]}
-        new_mk = {}
-        for _, row in ped.iterrows():
-            k = row.get("_key")
-            if not (isinstance(k, str) and k):
-                continue
-            is_men = (row.get("面/門前") == "面")
-            if k in auto_men and is_men != auto_men[k]:
-                new_mk[k] = is_men
-        if _recs_sig(pnew, "rx") != _recs_sig(precs, "rx") or new_mk != mk:
-            ph_edit[sel] = pnew                  # 保存のみ（st.rerunしない）
+        if st.button("🔄 薬局の修正を反映（再計算）", key=f"apply_ph_{sel}", type="primary"):
+            pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
+            auto_men = {r["key"]: r["auto_menkata"] for r in c["classified"]}
+            new_mk = {}
+            for _, row in ped.iterrows():
+                k = row.get("_key")
+                if not (isinstance(k, str) and k):
+                    continue
+                is_men = (row.get("面/門前") == "面")
+                if k in auto_men and is_men != auto_men[k]:
+                    new_mk[k] = is_men
+            ph_edit[sel] = pnew
             mk_all[sel] = new_mk
+            st.session_state.pop(f"ph_edit_{sel}", None)    # ウィジェット状態をクリア＝追加行の重複増殖を防止
+            st.rerun(scope="app")
 
-    # ═══ 第2パス：上の手修正を反映して再計算し、確保しておいた表示枠を最新値で描画 ═══
+
+raws = st.session_state.get("multi_raw", [])
+if raws:
+    # 確定済みの手修正（session_state）を反映して計算（編集フォームは fragment で隔離）。
     computed = [compute_candidate(r) for r in raws]
+
+    st.markdown("#### 2. 比較結果")
+    rows = []
+    for cc in computed:
+        med, foot = cc["med_total"], cc["foot_total"]
+        vals = [v for v in (med, foot) if v is not None]
+        rng = f"{min(vals):,.0f}〜{max(vals):,.0f}" if len(vals) == 2 else "—"
+        rows.append({
+            "ラベル": cc["label"], "店舗名/メモ": cc["name"], "住所": cc["addr"][:24],
+            "① 医療機関(年)": round(med) if med is not None else None,
+            "① 医療機関(月)": round(med / 12) if med is not None else None,
+            "② 集客(年)": round(foot) if foot is not None else None,
+            "② 集客(月)": round(foot / 12) if foot is not None else None,
+            "予測レンジ(年)": rng, "面競合数": cc["comp_n"], "寄与医療機関数": len(cc["huff_rows"]),
+        })
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, use_container_width=True,
+        column_config={cn: st.column_config.NumberColumn(cn, format="%d 枚")
+                       for cn in ["① 医療機関(年)", "① 医療機関(月)", "② 集客(年)", "② 集客(月)"]},
+    )
+    ranked = sorted(computed, key=lambda x: (x["foot_total"] or x["med_total"] or 0), reverse=True)
+    st.success(f"🏆 最大の候補地： **{ranked[0]['label']}**"
+               f"（{ranked[0]['name'] or ranked[0]['addr'][:20]}）")
+
+    st.markdown("#### 3. 候補地ごとの詳細（ロジックの内訳）")
+    sel = st.selectbox("詳細を見る候補地", [c["label"] for c in computed],
+                       format_func=lambda x: f"{x}　" + next((c["name"] or c["addr"][:16]
+                                                              for c in computed if c["label"] == x), ""))
     c = next(x for x in computed if x["label"] == sel)
 
-    with cmp_area:
-        rows = []
-        for cc in computed:
-            med, foot = cc["med_total"], cc["foot_total"]
-            vals = [v for v in (med, foot) if v is not None]
-            rng = f"{min(vals):,.0f}〜{max(vals):,.0f}" if len(vals) == 2 else "—"
-            rows.append({
-                "ラベル": cc["label"], "店舗名/メモ": cc["name"], "住所": cc["addr"][:24],
-                "① 医療機関(年)": round(med) if med is not None else None,
-                "① 医療機関(月)": round(med / 12) if med is not None else None,
-                "② 集客(年)": round(foot) if foot is not None else None,
-                "② 集客(月)": round(foot / 12) if foot is not None else None,
-                "予測レンジ(年)": rng, "面競合数": cc["comp_n"], "寄与医療機関数": len(cc["huff_rows"]),
-            })
-        st.dataframe(
-            pd.DataFrame(rows), hide_index=True, use_container_width=True,
-            column_config={cn: st.column_config.NumberColumn(cn, format="%d 枚")
-                           for cn in ["① 医療機関(年)", "① 医療機関(月)", "② 集客(年)", "② 集客(月)"]},
-        )
-        ranked = sorted(computed, key=lambda x: (x["foot_total"] or x["med_total"] or 0), reverse=True)
-        st.success(f"🏆 最大の候補地： **{ranked[0]['label']}**"
-                   f"（{ranked[0]['name'] or ranked[0]['addr'][:20]}）")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("① 医療機関ベース（ハフ）", f"{c['med_total']:,.0f} 枚/年",
+              f"月 {c['med_total']/12:,.0f} 枚")
+    if c["foot_total"] is not None:
+        m2.metric("② 集客ベース", f"{c['foot_total']:,.0f} 枚/年", f"月 {c['foot_total']/12:,.0f} 枚")
+    else:
+        m2.metric("② 集客ベース", "未入力")
+    m3.metric("面競合数 / 除外", f"{c['comp_n']} / {c['comp_excluded']}")
 
-    with detail_area:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("① 医療機関ベース（ハフ）", f"{c['med_total']:,.0f} 枚/年",
-                  f"月 {c['med_total']/12:,.0f} 枚")
-        if c["foot_total"] is not None:
-            m2.metric("② 集客ベース", f"{c['foot_total']:,.0f} 枚/年", f"月 {c['foot_total']/12:,.0f} 枚")
-        else:
-            m2.metric("② 集客ベース", "未入力")
-        m3.metric("面競合数 / 除外", f"{c['comp_n']} / {c['comp_excluded']}")
-
-        st.markdown("##### 🗺 商圏マップ（周辺の医療機関・薬局）")
+    st.markdown("##### 🗺 商圏マップ（周辺の医療機関・薬局）")
+    show_map = st.checkbox(
+        "地図を表示する（⚠️ 重い処理。**施設の追加・修正が終わってから**オンにしてスクショ推奨）",
+        value=False, key=f"showmap_{sel}",
+        help="地図の再描画は重いので、編集中はオフのままが快適です。オフでも①②の数字・下の内訳表は反映済みです。",
+    )
+    if show_map:
         st.caption("このままスクショしてお客様提示にお使いください。手動で追加・削除・座標修正した施設もそのまま反映されます。"
                    "★＝候補地／◯＝商圏／青＝診療所・濃青＝病院・紫＝美容／緑＝薬局(面)・橙＝薬局(門前)。"
                    "マーカーをクリックすると距離・診療科・外来・実績などが表示されます。")
         st_folium(build_map(c, radius_m), height=540, returned_objects=[],
                   use_container_width=True, key=f"map_{sel}")
+    else:
+        st.caption("地図はオフ中（編集がサクサク動きます）。編集が終わったら上のチェックをオンにして地図を表示・スクショしてください。")
 
-        st.markdown("##### ① 医療機関ベース：ハフの取り分内訳")
-        st.caption("各クリニックが出す処方箋（原資）を、自店の重み ÷（自店の重み＋競合の重み合計）の"
-                   "取り分率で獲得します。合計＝①予測。")
-        hb_df = pd.DataFrame([{
-            "医療機関": row["clinic"], "診療科": row.get("dept", "その他"),
-            "発行率": round(row.get("issue", 0.0), 2), "距離(m)": round(row["dist"]),
-            "年間院外処方(原資)": round(row["pool"]),
-            "自店の重み": round(row["self_w"], 3), "競合の重み合計": round(row["comp_w"], 3),
-            "取り分率": round(row["share"], 3), "獲得(枚/年)": round(row["captured"]),
-        } for row in c["huff_rows"]])
-        st.dataframe(hb_df, hide_index=True, use_container_width=True, column_config={
-            "発行率": st.column_config.NumberColumn("発行率", format="%.2f"),
-            "取り分率": st.column_config.NumberColumn("取り分率", format="%.3f"),
-            "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
-        })
+    st.markdown("##### ① 医療機関ベース：ハフの取り分内訳")
+    st.caption("各クリニックが出す処方箋（原資）を、自店の重み ÷（自店の重み＋競合の重み合計）の"
+               "取り分率で獲得します。合計＝①予測。")
+    hb_df = pd.DataFrame([{
+        "医療機関": row["clinic"], "診療科": row.get("dept", "その他"),
+        "発行率": round(row.get("issue", 0.0), 2), "距離(m)": round(row["dist"]),
+        "年間院外処方(原資)": round(row["pool"]),
+        "自店の重み": round(row["self_w"], 3), "競合の重み合計": round(row["comp_w"], 3),
+        "取り分率": round(row["share"], 3), "獲得(枚/年)": round(row["captured"]),
+    } for row in c["huff_rows"]])
+    st.dataframe(hb_df, hide_index=True, use_container_width=True, column_config={
+        "発行率": st.column_config.NumberColumn("発行率", format="%.2f"),
+        "取り分率": st.column_config.NumberColumn("取り分率", format="%.3f"),
+        "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
+    })
 
-        if c["foot"]:
-            st.markdown("##### ② 集客ベース：内訳")
-            fo, fp = c["foot"], c["fp"]
-            st.markdown(
-                f"- 館の来店客数 {c['uni']:,.0f}人 × **周知率 {c['exposure']:.2f}** = 有効客数 **{c['eff_uni']:,.0f}人**"
-                f"（65+ {fo['u65']:,.0f} / 65− {fo['u_under']:,.0f}）\n"
-                f"- 年間受診延べ {fo['annual_visits']:,.0f}回 → 院外処方プール {fo['rx_pool']:,.0f}枚\n"
-                f"- 利用率 {fp.use_rate:.1%} ÷ (面競合の実効パワー {c['comp_power']:.1f}"
-                f"〔面{c['comp_n']}店・距離減衰λ={fp.competitor_decay_m:.0f}m〕 + 1) = シェア {fo['share']:.2%}\n"
-                f"- **獲得 = {fo['total']:,.0f} 枚/年**"
-            )
+    if c["foot"]:
+        st.markdown("##### ② 集客ベース：内訳")
+        exp_all = st.session_state.setdefault("exp_multi", {})
+        new_exp = st.number_input(
+            f"周知率（{sel}）— 館の来店客のうち薬局に接触する割合", 0.0, 1.0,
+            float(c["exposure"]), 0.05, format="%.2f", key=f"exp_{sel}",
+            help="食品スーパー=1.0／大型モール1階・主動線=0.3／上層階・動線外=0.1。変更すると②が再計算されます。",
+        )
+        if abs(new_exp - c["exposure"]) > 1e-9:
+            exp_all[sel] = new_exp
+            st.rerun()
+        fo, fp = c["foot"], c["fp"]
+        st.markdown(
+            f"- 館の来店客数 {c['uni']:,.0f}人 × **周知率 {c['exposure']:.2f}** = 有効客数 **{c['eff_uni']:,.0f}人**"
+            f"（65+ {fo['u65']:,.0f} / 65− {fo['u_under']:,.0f}）\n"
+            f"- 年間受診延べ {fo['annual_visits']:,.0f}回 → 院外処方プール {fo['rx_pool']:,.0f}枚\n"
+            f"- 利用率 {fp.use_rate:.1%} ÷ (面競合の実効パワー {c['comp_power']:.1f}"
+            f"〔面{c['comp_n']}店・距離減衰λ={fp.competitor_decay_m:.0f}m〕 + 1) = シェア {fo['share']:.2%}\n"
+            f"- **獲得 = {fo['total']:,.0f} 枚/年**"
+        )
+
+    # ── 確認・修正フォーム（fragment：行追加してもアプリ全体は再実行しない） ──────────
+    st.markdown("##### 🔧 確認・修正（漏れの追加・座標・面/門前・診療科・外来など）")
+    st.caption("💡 施設の追加・修正は**何行でも続けて**行えます（サクサク動きます）。"
+               "終わったら各フォームの **「反映して再計算」** を押すと、上の①②予測とマップに反映されます。")
+    render_med_editor(sel, c, int(med_high_thr))
+    render_ph_editor(sel, c)
 
     # ── 4. Excel ─────────────────────────────────────────────────────────────
     st.markdown("#### 4. 数式入りExcelで書き出し")
