@@ -2535,6 +2535,8 @@ def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon, cat_col=
             if (lat is None or lon is None) and dist is not None and dist > 0:
                 lat, lon = clat + dist / 111000.0, clon  # 新規・距離のみ→真北に仮置き
         if name or (lat is not None and lon is not None):
+            if not key and name:
+                key = f"name:{name}"   # 手動追加行に安定キー付与（facility_key/pharmacy_keyと一致）
             rec = {"name": name, "lat": lat, "lon": lon, num_store: nv, "_key": key}
             if cat_col:
                 cv = row.get(cat_col)
@@ -2545,7 +2547,16 @@ def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon, cat_col=
             if issue_col:
                 rec["issue_disp"] = _num(row.get(issue_col))
             out.append(rec)
-    return out
+    # キー重複を除去（data_editorの追加行が基データにも残ると二重化するのを防ぐ。先勝ち）
+    seen, deduped = set(), []
+    for rec in out:
+        k = rec.get("_key")
+        if k and k in seen:
+            continue
+        if k:
+            seen.add(k)
+        deduped.append(rec)
+    return deduped
 
 
 def effective_facilities(raw, clat, clon, label):
@@ -3200,19 +3211,41 @@ if run:
 @st.fragment
 def render_med_editor(sel, c, med_high_thr_v):
     dr = get_dept_rates()
+    med_edit = st.session_state.setdefault("med_edit", {})
+    recs = med_edit.setdefault(sel, [])
     med_flags = [clinic_flag(f, med_high_thr_v) for f in c["med"]]
     n_alert = sum(1 for x in med_flags if x)
     if n_alert:
-        st.warning(f"⚠️ 医療機関に **{n_alert}件** の要確認あり（外れ値/外来不明）。『検証』列を確認し、"
+        st.warning(f"⚠️ 医療機関に **{n_alert}件** の要確認あり（外れ値/外来不明）。表の『検証』列を確認し、"
                    "外来数・院外区分・座標を必要に応じて修正してください。")
-    with st.expander("🔧 医療機関の確認・修正（座標／外来数／院外区分／診療科／漏れの追加・削除 → ①に反映）", expanded=bool(n_alert)):
-        st.caption(
-            "『距離(m)』が実態と違う施設は座標がズレています（緯度経度を直すのが最も正確／距離を直接入力も可）。"
-            "行を追加・修正・削除したら、最後に **「反映して再計算」** を押すと①予測・マップに反映されます"
-            "（編集中は全体を再計算しないので、続けて何行でもサクサク追加できます）。"
-        )
-        med_edit = st.session_state.setdefault("med_edit", {})
-        recs = med_edit.get(sel, [])
+    with st.expander("🔧 医療機関の確認・修正（漏れの追加・座標・外来・院外区分・診療科・削除 → ①に反映）", expanded=bool(n_alert)):
+        # ── ➕ 漏れた医療機関を追加（フォーム＝確実に追加。消えない・戻らない） ──
+        with st.form(f"addmed_{sel}", clear_on_submit=True):
+            st.markdown("**➕ 漏れた医療機関を追加**（Google Map等で見つけたクリニック。距離だけでもOK）")
+            a1, a2, a3 = st.columns([3, 2, 2])
+            nm = a1.text_input("医療機関名", key=f"amnm_{sel}")
+            dist = a2.number_input("候補地からの距離(m)", 0, 6000, 0, 50, key=f"amdist_{sel}")
+            op_in = a3.number_input("外来(人/日)", 0, 3000, 0, 5, key=f"amop_{sel}")
+            b1, b2, b3, b4 = st.columns(4)
+            la = b1.text_input("緯度(任意・最も正確)", key=f"amla_{sel}")
+            lo = b2.text_input("経度(任意)", key=f"amlo_{sel}")
+            dept_in = b3.selectbox("診療科", DEPT_OPTIONS, key=f"amdept_{sel}")
+            cat_in = b4.selectbox("院外区分", _EXT_CATS, key=f"amcat_{sel}")
+            if st.form_submit_button("➕ 追加する", type="primary"):
+                nm = (nm or "").strip()
+                lat, lon = _num(la), _num(lo)
+                if (lat is None or lon is None) and dist > 0:
+                    lat, lon = c["clat"] + dist / 111000.0, c["clon"]
+                if nm and lat is not None and lon is not None:
+                    recs.append({"name": nm, "lat": lat, "lon": lon,
+                                 "op": (int(op_in) if op_in else None),
+                                 "cat": cat_in, "dept": dept_in, "issue": None,
+                                 "_key": f"name:{nm}"})
+                    st.rerun(scope="app")
+                else:
+                    st.warning("医療機関名と、距離または緯度経度を入力してください。")
+        st.caption("下の表で既存施設の**座標・外来・院外区分・診療科の修正や行削除**ができます"
+                   "（修正後は「反映して再計算」を押す）。緯度経度はGoogle Mapで右クリックすると取得できます。")
         fmap = {facility_key(f): fl for f, fl in zip(c["med"], med_flags)}
         sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
                      for f in c["med"]}
@@ -3284,16 +3317,38 @@ def render_med_editor(sel, c, med_high_thr_v):
 
 @st.fragment
 def render_ph_editor(sel, c):
-    with st.expander("🔧 薬局の確認・修正（座標／実績／面・門前／漏れの追加・削除 → ①②に反映）", expanded=False):
-        st.caption(
-            "座標(緯度・経度)がズレている薬局は正しい値に直し（距離(m)直接入力も可）、漏れている薬局は行追加、"
-            "誤検出は行削除。『面/門前』もここで修正できます。行を追加・修正したら、最後に "
-            "**「反映して再計算」** を押すと①②に反映されます（編集中は全体を再計算しません）。"
-        )
-        ph_edit = st.session_state.setdefault("ph_edit", {})
-        mk_all = st.session_state.setdefault("mk_multi", {})
-        mk = mk_all.setdefault(sel, {})
-        precs = ph_edit.get(sel, [])
+    ph_edit = st.session_state.setdefault("ph_edit", {})
+    mk_all = st.session_state.setdefault("mk_multi", {})
+    mk = mk_all.setdefault(sel, {})
+    precs = ph_edit.setdefault(sel, [])
+    with st.expander("🔧 薬局の確認・修正（漏れの追加・座標・実績・面/門前・削除 → ①②に反映）", expanded=False):
+        # ── ➕ 漏れた薬局を追加（フォーム＝確実に追加。面/門前もそのまま保存） ──
+        with st.form(f"addph_{sel}", clear_on_submit=True):
+            st.markdown("**➕ 漏れた薬局を追加**（Google Map等で見つけた店。距離だけでもOK）")
+            a1, a2, a3, a4 = st.columns([3, 2, 2, 2])
+            nm = a1.text_input("薬局名", key=f"apnm_{sel}")
+            dist = a2.number_input("候補地からの距離(m)", 0, 6000, 0, 50, key=f"apdist_{sel}")
+            rx_in = a3.number_input("実績(枚/年・任意)", 0, 200000, 0, 100, key=f"aprx_{sel}")
+            men_in = a4.selectbox("面/門前", ["面", "門前"], key=f"apmen_{sel}",
+                                  help="面＝集客の競合に数える／門前＝競合から外す")
+            b1, b2 = st.columns(2)
+            la = b1.text_input("緯度(任意・最も正確)", key=f"apla_{sel}")
+            lo = b2.text_input("経度(任意)", key=f"aplo_{sel}")
+            if st.form_submit_button("➕ 追加する", type="primary"):
+                nm = (nm or "").strip()
+                lat, lon = _num(la), _num(lo)
+                if (lat is None or lon is None) and dist > 0:
+                    lat, lon = c["clat"] + dist / 111000.0, c["clon"]
+                if nm and lat is not None and lon is not None:
+                    key = f"name:{nm}"
+                    precs.append({"name": nm, "lat": lat, "lon": lon,
+                                  "rx": (int(rx_in) if rx_in else None), "_key": key})
+                    mk[key] = (men_in == "面")   # 面/門前の手動選択を確実に保存（自動判定に戻らない）
+                    st.rerun(scope="app")
+                else:
+                    st.warning("薬局名と、距離または緯度経度を入力してください。")
+        st.caption("下の表で既存薬局の**座標・実績・面/門前の修正や行削除**ができます"
+                   "（修正後は「反映して再計算」を押す）。『最寄りクリニック(m)』が近い店が門前の目安。")
         clmap = {r["key"]: r for r in c["classified"]}
         psched_map = {pharmacy_key(p): parse_open_schedule(getattr(p, "raw_fields", None))
                       for p in c["ph"]}
@@ -3331,11 +3386,16 @@ def render_ph_editor(sel, c):
             auto_men = {r["key"]: r["auto_menkata"] for r in c["classified"]}
             new_mk = {}
             for _, row in ped.iterrows():
+                name = str(row.get("薬局") or "").strip()
                 k = row.get("_key")
-                if not (isinstance(k, str) and k):
+                # 手動追加行は _key が空なので、名前から合成キーを作る（pharmacy_keyと一致）
+                k = k if (isinstance(k, str) and k) else (f"name:{name}" if name else None)
+                if not k:
                     continue
                 is_men = (row.get("面/門前") == "面")
-                if k in auto_men and is_men != auto_men[k]:
+                # 自動判定に無い（＝まだ計算に含まれない手動追加）行は選択を必ず保存。
+                # 既存行は自動と異なるときだけ上書き保存。
+                if k not in auto_men or is_men != auto_men[k]:
                     new_mk[k] = is_men
             ph_edit[sel] = pnew
             mk_all[sel] = new_mk
