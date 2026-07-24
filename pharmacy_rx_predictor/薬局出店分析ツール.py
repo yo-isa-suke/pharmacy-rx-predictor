@@ -3314,7 +3314,7 @@ def render_ph_editor(sel, c):
         ped = st.data_editor(
             pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
             key=f"ph_edit_{sel}",
-            disabled=["距離(m)", "最寄りクリニック(m)", "_key", "開局日", "開局時間"],
+            disabled=["最寄りクリニック(m)", "_key", "開局日", "開局時間"],
             column_config={
                 "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                 "経度": st.column_config.NumberColumn("経度", format="%.6f"),
