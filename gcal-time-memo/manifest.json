@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Googleカレンダー 時間メモ",
+  "description": "Googleカレンダー上でドラッグ選択した空き時間を、メールにそのまま貼れる日程候補テキストに自動変換してコピーできます。",
+  "version": "1.0.0",
+  "permissions": ["storage"],
+  "host_permissions": ["https://calendar.google.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "時間メモを開始 / 終了",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://calendar.google.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
