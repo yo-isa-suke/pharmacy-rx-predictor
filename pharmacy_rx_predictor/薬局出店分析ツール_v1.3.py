@@ -83,7 +83,7 @@ MHLW_BASE   = MHLW_DOMAIN + "/znk-web"
 WORKING_DAYS = 305
 
 # ─── v1.3: 取得の並列度とデータ品質フラグのしきい値 ───────────────────────────
-FETCH_WORKERS_DEFAULT = 8     # ナビィ詳細ページの同時取得数（サイドバーで変更可）
+FETCH_WORKERS_DEFAULT = 8     # ナビィ詳細ページの同時取得数（固定値）
 OSM_BUDGET_S = 30             # OSM(Overpass)の待ち時間の上限。超えたらナビィのみで続行
 OP_LOW_THR_DEFAULT    = 10    # 外来患者数がこの人数以下なら要確認（過小・未報告疑い）
 OP_HIGH_THR_DEFAULT   = 500   # 外来患者数がこの人数以上なら要確認（月間・年間値の混入疑い）
@@ -2903,11 +2903,8 @@ with st.sidebar:
     gate_m = 50
 
     st.divider()
-    st.subheader("⚡ 速度（v1.3）")
-    fetch_workers = int(st.slider(
-        "ナビィ詳細ページの同時取得数", 1, 12, FETCH_WORKERS_DEFAULT, 1,
-        help="大きいほど速い（既定8で1店あたり1〜2分）。取得エラーが増える場合は下げてください。",
-    ))
+    st.subheader("⚡ 速度")
+    fetch_workers = FETCH_WORKERS_DEFAULT   # ナビィ詳細ページの同時取得数（固定・変更不要）
     verify_pass = st.checkbox(
         "念のため再検索する（推考①②・遅い）", value=False,
         help="同じ条件でナビィをもう一度検索して漏れを確認します。通常は結果が変わらず"
@@ -2918,8 +2915,8 @@ with st.sidebar:
         help=f"ナビィに載らない施設を補うためOSMも検索します（ナビィ検索と並行実行・最大{OSM_BUDGET_S}秒で打ち切り）。"
              "OSMのサーバが不調で結果0件が続く場合はOFFにすると更に速くなります。",
     )
-    st.caption(f"→ 取得済みの施設ページはメモリにキャッシュされます"
-               f"（同じエリアの2店舗目以降・再分析は更に高速）。")
+    st.caption(f"→ ナビィの詳細ページは{FETCH_WORKERS_DEFAULT}並列で取得し、取得済みページはメモリに"
+               f"キャッシュされます（同じエリアの2店舗目以降・再分析は更に高速）。")
 
     st.divider()
     st.subheader("🛒 集客ベースの前提（全候補地に共通）")
@@ -3754,8 +3751,7 @@ if run:
     if not todo:
         st.info("入力中の候補地はすべて分析済みです。やり直すには『🗑 結果をクリア』を押してください。")
     else:
-        st.info(f"未分析 {len(todo)}件を順に分析します"
-                f"（v1.3：{int(fetch_workers)}並列で取得。1件あたり目安1〜2分）。")
+        st.info(f"未分析 {len(todo)}件を順に分析します（1件あたり目安1〜2分）。")
         overall = st.progress(0.0, text="開始…")
         for i, (label, row) in enumerate(todo):
             addr = str(row["住所"]).strip()
@@ -3797,20 +3793,114 @@ if run:
 #  押すと1回目のクリックがセル確定に吸われて再計算されない事象があった。form化で
 #  編集中の再実行が起きなくなり、追加・修正が確実に反映される。
 #  （反映時は session_state へ保存→ウィジェット状態をクリア→全体再計算。従来どおり）
+
+def _row_flag(r, fmap, high_thr, low_thr):
+    """表示行の『検証』文字列。基データにあればそのフラグ、手動追加行は外来数から判定。"""
+    f = fmap.get(r.get("_key"))
+    if f is not None:
+        return f
+    op = _num(r.get("op"))
+    if op is None:
+        return "🔴 外来不明"
+    if op <= low_thr:
+        return f"🔴 外来{int(op)}人/日（{int(low_thr)}人以下・過小/未報告の疑い）"
+    if op >= high_thr:
+        return f"🔴 外来{int(op)}人/日（{int(high_thr)}人以上・月間/年間値の混入疑い）"
+    return ""
+
+
 def render_med_editor(sel, c, med_high_thr_v, med_low_thr_v=OP_LOW_THR_DEFAULT):
+    """医療機関の一覧＝確認と修正を同じ表で行うメインUI（v1.3で画面の主役に変更）。
+
+    使い方の想定：『検証』列の🔴を見て怪しい施設を見つけ、その場で外来(人/日)や診療科を
+    正しい値に打ち直し、「反映して再計算」で①の予測に反映する。
+    """
     dr = get_dept_rates()
     med_edit = st.session_state.setdefault("med_edit", {})
     recs = med_edit.setdefault(sel, [])
-    med_flags = [clinic_flag(f, med_high_thr_v, med_low_thr_v) for f in c["med"]]
-    n_alert = sum(1 for x in med_flags if x)
+    fmap = {facility_key(f): clinic_flag(f, med_high_thr_v, med_low_thr_v) for f in c["med"]}
+    sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
+                 for f in c["med"]}
+
+    st.markdown("##### 🏥 医療機関の確認・修正（① 医療機関ベースの元データ）")
+    rows = []
+    for r in recs:
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        dept = r.get("dept") if r.get("dept") in DEPT_OPTIONS else "その他"
+        rows.append({
+            "検証": _row_flag(r, fmap, med_high_thr_v, med_low_thr_v),
+            "医療機関": r.get("name"),
+            "距離(m)": (round(haversine(c["clat"], c["clon"], lat, lon))
+                       if (lat is not None and lon is not None) else None),
+            "外来(人/日)": r.get("op"),
+            "診療科": dept,
+            "発行率": eff_issue_rate(dept, _num(r.get("issue")), dr),
+            "院外区分": (r.get("cat") if r.get("cat") in _EXT_CATS else "不明"),
+            "診療日": sched_map.get(r.get("_key"), ("", ""))[0],
+            "診療時間": sched_map.get(r.get("_key"), ("", ""))[1],
+            "緯度": lat, "経度": lon,
+            "_key": r.get("_key"),
+        })
+
+    n_alert = sum(1 for x in rows if x["検証"])
+    n_unknown = sum(1 for x in rows if "外来不明" in (x["検証"] or ""))
     if n_alert:
-        st.error(f"🔴 医療機関に **{n_alert}件** の要確認があります（外来不明／{int(med_low_thr_v)}人以下／"
-                 f"{int(med_high_thr_v)}人以上）。下の表の『検証』列を確認し、"
-                 "外来数・院外区分・座標を必要に応じて修正してください。")
-    with st.expander("🔧 医療機関の確認・修正（漏れの追加・座標・外来・院外区分・診療科・削除 → ①に反映）", expanded=bool(n_alert)):
-        # ── ➕ 漏れた医療機関を追加（フォーム＝確実に追加。消えない・戻らない） ──
+        st.error(f"🔴 **{n_alert}件が要確認**（うち外来不明 {n_unknown}件）"
+                 f"— 外来不明／{int(med_low_thr_v)}人以下／{int(med_high_thr_v)}人以上。"
+                 "『検証』列に🔴が付いた行は、ナビィ原本やGoogleマップで確かめて"
+                 "**外来(人/日)・診療科・院外区分を下の表に直接入力し直してください。**")
+    else:
+        st.success("✅ 外来患者数の要確認はありません（不明・過小・過大の該当なし）。")
+    st.caption("この表がそのまま①の計算に使われます。セルを編集 →「🔄 反映して再計算」で"
+               "上の予測・マップに反映されます。行の削除（左端で選択して delete）や"
+               "漏れた施設の追加もできます。")
+
+    if st.checkbox("🔴 要確認の行を上に並べる", value=True, key=f"srt_{sel}"):
+        rows.sort(key=lambda x: (0 if x["検証"] else 1,
+                                 x["距離(m)"] if x["距離(m)"] is not None else 9_999_999))
+
+    disp = pd.DataFrame(rows)
+    # 欠測は "None" ではなく空欄で見せる（外来未入力＝空欄。『検証』列に「🔴 外来不明」が出る）
+    for _c, _t in (("外来(人/日)", "Int64"), ("距離(m)", "Int64"),
+                   ("緯度", "float"), ("経度", "float"), ("発行率", "float")):
+        if _c in disp:
+            disp[_c] = pd.to_numeric(disp[_c], errors="coerce").astype(_t)
+    with st.form(f"medform_{sel}", border=False):
+        ed = st.data_editor(
+            disp, hide_index=True, use_container_width=True, num_rows="dynamic",
+            key=f"med_edit_{sel}", disabled=["検証", "_key", "診療日", "診療時間"],
+            height=min(620, 60 + 35 * max(len(rows), 3)),
+            column_config={
+                "検証": st.column_config.TextColumn(
+                    "検証", width="large",
+                    help="🔴＝要確認。外来患者数がナビィ未入力／過小／過大（月間・年間値の混入疑い）。"),
+                "医療機関": st.column_config.TextColumn("医療機関", width="medium"),
+                "外来(人/日)": st.column_config.NumberColumn(
+                    "外来(人/日) ※空欄(None)＝不明", min_value=0, step=1,
+                    help="ナビィの1日平均外来患者数。空欄（Noneと表示）＝ナビィに入力なし＝不明。"
+                         "正しい値を入れると①の予測に即反映されます。"),
+                "診療科": st.column_config.SelectboxColumn(
+                    "診療科", options=DEPT_OPTIONS, width="small",
+                    help="標榜診療科から自動判定。変えると発行率がその科の初期値になります。"),
+                "発行率": st.column_config.NumberColumn(
+                    "発行率", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                    help="この施設だけ発行率を手入力で上書きできます（受診のうち投薬に至る割合）。"),
+                "院外区分": st.column_config.SelectboxColumn("院外区分", options=_EXT_CATS, width="medium"),
+                "距離(m)": st.column_config.NumberColumn(
+                    "距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
+                "診療日": st.column_config.TextColumn("診療日", help="ナビィの診療時間表から抽出（開いている曜日）。"),
+                "診療時間": st.column_config.TextColumn("診療時間", help="ナビィの診療時間表から抽出（代表的な時間帯）。"),
+                "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
+                "経度": st.column_config.NumberColumn("経度", format="%.6f"),
+            },
+        )
+        apply_med = st.form_submit_button("🔄 反映して再計算", type="primary")
+        st.caption("※ セル入力の直後は1回目のクリックが入力確定に使われることがあります。"
+                   "上の①②の数字が変わらない場合はもう一度押してください。")
+
+    # ── ➕ 漏れた医療機関を追加（フォーム＝確実に追加。消えない・戻らない） ──
+    with st.expander("➕ 漏れた医療機関を追加（Google Map等で見つけたクリニック）", expanded=False):
         with st.form(f"addmed_{sel}", clear_on_submit=True):
-            st.markdown("**➕ 漏れた医療機関を追加**（Google Map等で見つけたクリニック。距離だけでもOK）")
             a1, a2, a3 = st.columns([3, 2, 2])
             nm = a1.text_input("医療機関名", key=f"amnm_{sel}")
             dist = a2.number_input("候補地からの距離(m)", 0, 6000, 0, 50, key=f"amdist_{sel}")
@@ -3820,6 +3910,7 @@ def render_med_editor(sel, c, med_high_thr_v, med_low_thr_v=OP_LOW_THR_DEFAULT):
             lo = b2.text_input("経度(任意)", key=f"amlo_{sel}")
             dept_in = b3.selectbox("診療科", DEPT_OPTIONS, key=f"amdept_{sel}")
             cat_in = b4.selectbox("院外区分", _EXT_CATS, key=f"amcat_{sel}")
+            st.caption("距離だけでもOK（候補地の真北に仮置きします）。緯度経度はGoogle Mapで右クリックすると取得できます。")
             if st.form_submit_button("➕ 追加する", type="primary"):
                 nm = (nm or "").strip()
                 lat, lon = _num(la), _num(lo)
@@ -3833,82 +3924,31 @@ def render_med_editor(sel, c, med_high_thr_v, med_low_thr_v=OP_LOW_THR_DEFAULT):
                     st.rerun(scope="app")
                 else:
                     st.warning("医療機関名と、距離または緯度経度を入力してください。")
-        st.caption("下の表で既存施設の**座標・外来・院外区分・診療科の修正や行削除**ができます"
-                   "（修正後は「反映して再計算」を押す）。緯度経度はGoogle Mapで右クリックすると取得できます。")
-        fmap = {facility_key(f): fl for f, fl in zip(c["med"], med_flags)}
-        sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
-                     for f in c["med"]}
 
-        def _disp_dept(r):
-            d = r.get("dept")
-            return d if d in DEPT_OPTIONS else "その他"
-
-        disp = pd.DataFrame([{
-            "医療機関": r.get("name"),
-            "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
-                       if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
-            "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
-            "外来(人/日)": r.get("op"),
-            "院外区分": (r.get("cat") if r.get("cat") in _EXT_CATS else "不明"),
-            "診療科": _disp_dept(r),
-            "発行率": eff_issue_rate(_disp_dept(r), _num(r.get("issue")), dr),
-            "診療日": sched_map.get(r.get("_key"), ("", ""))[0],
-            "診療時間": sched_map.get(r.get("_key"), ("", ""))[1],
-            "検証": fmap.get(r.get("_key"), (
-                "🔴 外来不明" if _num(r.get("op")) is None else
-                (f"🔴 外来{int(_num(r.get('op')))}人/日（{int(med_high_thr_v)}人以上）"
-                 if _num(r.get("op")) >= med_high_thr_v else
-                 (f"🔴 外来{int(_num(r.get('op')))}人/日（{int(med_low_thr_v)}人以下）"
-                  if _num(r.get("op")) <= med_low_thr_v else "")))),
-            "_key": r.get("_key"),
-        } for r in recs])
-        with st.form(f"medform_{sel}", border=False):
-            ed = st.data_editor(
-                disp, hide_index=True, use_container_width=True, num_rows="dynamic",
-                key=f"med_edit_{sel}", disabled=["検証", "_key", "診療日", "診療時間"],
-                column_config={
-                    "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
-                    "経度": st.column_config.NumberColumn("経度", format="%.6f"),
-                    "距離(m)": st.column_config.NumberColumn("距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
-                    "外来(人/日)": st.column_config.NumberColumn("外来(人/日)", min_value=0, step=1),
-                    "院外区分": st.column_config.SelectboxColumn("院外区分", options=_EXT_CATS, width="medium"),
-                    "診療日": st.column_config.TextColumn("診療日", help="ナビィの診療時間表から抽出（開いている曜日）。"),
-                    "診療時間": st.column_config.TextColumn("診療時間", help="ナビィの診療時間表から抽出（代表的な時間帯）。"),
-                    "診療科": st.column_config.SelectboxColumn(
-                        "診療科", options=DEPT_OPTIONS, width="small",
-                        help="標榜診療科から自動判定。変えると発行率がその科の初期値になります。"),
-                    "発行率": st.column_config.NumberColumn(
-                        "発行率", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                        help="この施設だけ発行率を手入力で上書きできます（受診のうち投薬に至る割合）。"),
-                },
-            )
-            apply_med = st.form_submit_button("🔄 医療機関の修正を反映（再計算）", type="primary")
-            st.caption("※ セル入力の直後は1回目のクリックが入力確定に使われることがあります。"
-                       "上の①②の数字が変わらない場合はもう一度押してください。")
-        if apply_med:
-            new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
-                                    cat_col="院外区分", dept_col="診療科", issue_col="発行率")
-            old_map = {r.get("_key"): r for r in recs if r.get("_key")}
-            for nr in new_recs:
-                disp_iss = nr.pop("issue_disp", None)
-                old = old_map.get(nr.get("_key"))
-                old_dept = (old or {}).get("dept")
-                old_issue = (old or {}).get("issue")
-                old_eff = eff_issue_rate(
-                    old_dept if old_dept in dr else (nr.get("dept") or "その他"), old_issue, dr)
-                ndept = nr.get("dept")
-                if ndept is not None and ndept != old_dept:
-                    nr["issue"] = None                 # 診療科を変更→その科の初期値に従う
-                    nr["dept"] = ndept
-                elif disp_iss is not None and abs(disp_iss - old_eff) > 1e-6:
-                    nr["issue"] = disp_iss             # 発行率を手入力→この施設だけ上書き
-                    nr["dept"] = old_dept or ndept or "その他"
-                else:
-                    nr["issue"] = old_issue
-                    nr["dept"] = old_dept or ndept or "その他"
-            med_edit[sel] = new_recs
-            st.session_state.pop(f"med_edit_{sel}", None)   # ウィジェット状態をクリア＝追加行の重複増殖を防止
-            st.rerun(scope="app")
+    if apply_med:
+        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
+                                cat_col="院外区分", dept_col="診療科", issue_col="発行率")
+        old_map = {r.get("_key"): r for r in recs if r.get("_key")}
+        for nr in new_recs:
+            disp_iss = nr.pop("issue_disp", None)
+            old = old_map.get(nr.get("_key"))
+            old_dept = (old or {}).get("dept")
+            old_issue = (old or {}).get("issue")
+            old_eff = eff_issue_rate(
+                old_dept if old_dept in dr else (nr.get("dept") or "その他"), old_issue, dr)
+            ndept = nr.get("dept")
+            if ndept is not None and ndept != old_dept:
+                nr["issue"] = None                 # 診療科を変更→その科の初期値に従う
+                nr["dept"] = ndept
+            elif disp_iss is not None and abs(disp_iss - old_eff) > 1e-6:
+                nr["issue"] = disp_iss             # 発行率を手入力→この施設だけ上書き
+                nr["dept"] = old_dept or ndept or "その他"
+            else:
+                nr["issue"] = old_issue
+                nr["dept"] = old_dept or ndept or "その他"
+        med_edit[sel] = new_recs
+        st.session_state.pop(f"med_edit_{sel}", None)   # ウィジェット状態をクリア＝追加行の重複増殖を防止
+        st.rerun(scope="app")
 
 
 def render_ph_editor(sel, c):
@@ -3961,6 +4001,10 @@ def render_ph_editor(sel, c):
             "開局時間": psched_map.get(r.get("_key"), ("", ""))[1],
             "_key": r.get("_key"),
         } for r in precs])
+        for _c, _t in (("実績(枚/年)", "Int64"), ("距離(m)", "Int64"),
+                       ("最寄りクリニック(m)", "Int64"), ("緯度", "float"), ("経度", "float")):
+            if _c in pdisp:
+                pdisp[_c] = pd.to_numeric(pdisp[_c], errors="coerce").astype(_t)
         with st.form(f"phform_{sel}", border=False):
             ped = st.data_editor(
                 pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
@@ -3970,7 +4014,9 @@ def render_ph_editor(sel, c):
                     "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
                     "経度": st.column_config.NumberColumn("経度", format="%.6f"),
                     "距離(m)": st.column_config.NumberColumn("距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
-                    "実績(枚/年)": st.column_config.NumberColumn("実績(枚/年)", min_value=0, step=100),
+                    "実績(枚/年)": st.column_config.NumberColumn(
+                        "実績(枚/年) ※空欄(None)＝不明", min_value=0, step=100,
+                        help="ナビィの年間総取扱処方箋数。空欄（Noneと表示）＝ナビィに入力なし＝不明。"),
                     "面/門前": st.column_config.SelectboxColumn("面/門前", options=["面", "門前"], width="small",
                                                            help="面＝集客の競合に数える／門前＝競合から外す"),
                     "開局日": st.column_config.TextColumn("開局日", help="ナビィの開局時間表から抽出（開いている曜日）。"),
@@ -4032,13 +4078,6 @@ if raws:
     st.success(f"🏆 最大の候補地： **{ranked[0]['label']}**"
                f"（{ranked[0]['name'] or ranked[0]['addr'][:20]}）")
 
-    # ── 要確認（データ品質）の赤バナー：見落とし防止（v1.3） ──────────────────
-    _alerts = [(cc["label"], cc["n_alert"], cc["n_unknown_op"]) for cc in computed if cc["n_alert"]]
-    if _alerts:
-        _txt = " ／ ".join(f"**{lb}**：{na}件（うち外来不明 {nu}件）" for lb, na, nu in _alerts)
-        st.error(f"🔴 **外来患者数の要確認があります** → {_txt}\n\n"
-                 f"下の「3. 候補地ごとの詳細」→ **🔴 要確認リスト** で内容を確認してください"
-                 f"（外来不明／{int(med_low_thr)}人以下／{int(med_high_thr)}人以上）。")
 
     st.markdown("#### 3. 候補地ごとの詳細（ロジックの内訳）")
     sel = st.selectbox("詳細を見る候補地", [c["label"] for c in computed],
@@ -4055,26 +4094,8 @@ if raws:
         m2.metric("② 集客ベース", "未入力")
     m3.metric("面競合数 / 除外", f"{c['comp_n']} / {c['comp_excluded']}")
 
-    # ── 🔴 要確認リスト（赤字表示・見落とし防止） ─────────────────────────────
-    _rows_alert = [{
-        "🔴": "🔴" if clinic_flag_level(f, c["thr_hi"], c["thr_lo"]) == "alert" else "⚠️",
-        "医療機関": f.name,
-        "距離(m)": round(f.distance_m) if f.distance_m is not None else None,
-        "外来(人/日)": op_display(f),
-        "外来データ出典": getattr(f, "daily_outpatients_source", "—"),
-        "要確認の内容": c["flags"].get(facility_key(f), ""),
-    } for f in c["med"] if c["flags"].get(facility_key(f))]
-    if _rows_alert:
-        st.error(f"🔴 **要確認 {len(_rows_alert)}件**（外来不明／{int(c['thr_lo'])}人以下／"
-                 f"{int(c['thr_hi'])}人以上）— 数字をそのまま使わず、ナビィ原本やGoogleマップで確認してください。")
-        _df_alert = pd.DataFrame(_rows_alert)
-        st.dataframe(
-            _df_alert.style.map(lambda _v: "color:#B91C1C; font-weight:700"),
-            hide_index=True, use_container_width=True,
-        )
-        st.caption("※ 修正は下の「🔧 医療機関の確認・修正」から。外来患者数を直接入力すると①の予測に即反映されます。")
-    else:
-        st.success("✅ 外来患者数の要確認はありません（不明・過小・過大の該当なし）。")
+    # ── 医療機関テーブル（要確認フラグ入り・ここで外来数や診療科を直接修正する） ──
+    render_med_editor(sel, c, int(med_high_thr), int(med_low_thr))
 
     st.markdown("##### 🗺 商圏マップ（周辺の医療機関・薬局）")
     show_map = st.checkbox(
@@ -4132,11 +4153,10 @@ if raws:
             f"- **獲得 = {fo['total']:,.0f} 枚/年**"
         )
 
-    # ── 確認・修正フォーム（fragment：行追加してもアプリ全体は再実行しない） ──────────
-    st.markdown("##### 🔧 確認・修正（漏れの追加・座標・面/門前・診療科・外来など）")
-    st.caption("💡 施設の追加・修正は**何行でも続けて**行えます（サクサク動きます）。"
-               "終わったら各フォームの **「反映して再計算」** を押すと、上の①②予測とマップに反映されます。")
-    render_med_editor(sel, c, int(med_high_thr), int(med_low_thr))
+    # ── 薬局側の確認・修正 ────────────────────────────────────────────────
+    st.markdown("##### 🔧 薬局の確認・修正")
+    st.caption("💡 追加・修正は**何行でも続けて**行えます。終わったら **「反映して再計算」** を押すと、"
+               "上の①②予測とマップに反映されます。")
     render_ph_editor(sel, c)
 
     # ── 4. Excel ─────────────────────────────────────────────────────────────
