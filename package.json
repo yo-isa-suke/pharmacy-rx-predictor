@@ -1,0 +1,19 @@
+{
+  "name": "pharmacy-rx-predictor-cloudflare",
+  "private": true,
+  "description": "薬局 出店候補地 分析ツール v1.4 を Cloudflare Containers で公開するための設定",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "logs": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260818.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.123.0"
+  }
+}

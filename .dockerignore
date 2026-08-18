@@ -1,0 +1,20 @@
+.git
+.github
+__pycache__
+*.pyc
+node_modules
+src
+bento-diary
+pharmacy_rx_predictor/tests
+pharmacy_rx_predictor/__pycache__
+# v1.4 以外の旧バージョン・別ツールはイメージに入れない（サイズ削減）
+pharmacy_rx_predictor/app*.py
+pharmacy_rx_predictor/260702*.py
+pharmacy_rx_predictor/薬局出店分析ツール.py
+pharmacy_rx_predictor/薬局出店分析ツール_v1.0.py
+pharmacy_rx_predictor/薬局出店分析ツール_v1.1.py
+pharmacy_rx_predictor/薬局出店分析ツール_v1.2.py
+pharmacy_rx_predictor/薬局出店分析ツール_v1.3.py
+pharmacy_rx_predictor/*.html
+薬局出店分析ツール.py
+medical_finder.py
