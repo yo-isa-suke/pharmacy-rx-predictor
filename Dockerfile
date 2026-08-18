@@ -21,7 +21,7 @@ RUN apt-get update \
 # 依存だけ先に入れる（アプリ本体を変えてもここのレイヤーは再利用される＝ビルドが速い）
 # 版数を固定した requirements-container.txt を使う。元の requirements.txt は「>=」指定のため、
 # 再ビルドのたびに新版が入り、手元では動くのに公開版だけ壊れる、という事故が起きうる。
-COPY requirements-container.txt ./requirements.txt
+COPY pharmacy_rx_predictor/requirements-container.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # アプリ本体。ファイル名が日本語のままだとCMDや各種ツールで扱いづらいので app.py に置く。

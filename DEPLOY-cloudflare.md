@@ -93,7 +93,8 @@ Access を入れたあとは `APP_PASSWORD` は二重の鍵になります。外
 
 ```
 Dockerfile                  Streamlit v1.4 を動かすイメージ（linux/amd64）
-requirements-container.txt  版数を固定した依存（再ビルドで壊れないように）
+pharmacy_rx_predictor/
+  requirements-container.txt  版数を固定した依存（再ビルドで壊れないように）
 wrangler.jsonc              Worker とコンテナの設定
 src/index.ts                入口。パスワード認証 → コンテナへ中継（WebSocket対応）
 ```
@@ -121,4 +122,4 @@ Streamlit はブラウザとの通信に WebSocket を使うため、`src/index.
 |---|---|
 | 停止までの待ち時間を変える | `src/index.ts` の `sleepAfter`（既定 `"30m"`） |
 | メモリ・CPUを増やす | `wrangler.jsonc` の `instance_type`（`standard-1`〜`standard-4`） |
-| ライブラリを更新する | `requirements-container.txt`。更新後は `python3 pharmacy_rx_predictor/tests/test_e2e.py` を通してからデプロイ |
+| ライブラリを更新する | `pharmacy_rx_predictor/requirements-container.txt`。更新後は `python3 pharmacy_rx_predictor/tests/test_e2e.py` を通してからデプロイ |
