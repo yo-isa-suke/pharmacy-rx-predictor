@@ -1,0 +1,15 @@
+# Cloudflare Containers で使う版数を固定したもの。
+#
+# pharmacy_rx_predictor/requirements.txt は「>=」指定のため、イメージを再ビルドした
+# タイミングで破壊的変更を含む新版が入り、手元では動くのに公開版だけ壊れることがある。
+# ここに書いた版数は、実際に v1.4 のデータ収集～予測計算を通して動作を確認済み
+# （2026-08-18 時点）。上げるときは tests/test_e2e.py を通してから上げること。
+streamlit==1.61.1
+streamlit-folium==0.27.4
+folium==0.20.0
+requests==2.34.2
+beautifulsoup4==4.15.0
+lxml==6.1.1
+pandas==3.0.5
+openpyxl==3.1.5
+python-docx==1.2.0

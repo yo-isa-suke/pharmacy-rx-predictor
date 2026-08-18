@@ -8,12 +8,29 @@ medical_finder.py と pharmacy_area_finder.py を統合し、
   - 厚生労働省「医療情報ネット（ナビィ）」— 医療機関・薬局リスト・詳細
   - OpenStreetMap Overpass API — 施設の座標
   - 国土地理院（GSI）/ Nominatim — ジオコーディング
+
+v1.4 変更点 (2026-08-18):
+- 【重要・不具合修正】医療機関も薬局も1件も出てこなくなっていたのを修正。
+  ナビィの検索結果ページのHTML変更（施設名の見出しが h3.name → h2.name）に追随した。
+  検索リクエスト自体は成功していたが、一覧のパースが h3 決め打ちだったため
+  常に0件になっていた。h2/h3両対応＋「kikanCdを含むリンクを直接探す」
+  フォールバックを追加し、今後の同種の変更にも壊れにくくした。
+  詳細ページの「患者数」見出し（h3→h2）も同様に両対応にした。
+- 【漏れ対策】静かな打ち切りを廃止。総件数から必要ページ数を計算して全件取得し、
+  医療機関詳細の「先頭50件だけ」上限を撤廃。取りきれない場合は画面に警告を出す。
+- 【漏れ対策】重複排除を機関コード優先の厳密判定に変更（別法人・別店舗を消さない）。
+- 【漏れ対策】OSM検索に歯科（amenity=dentist）・relation・healthcare=pharmacy を追加。
+- 一覧に埋め込まれたGoogleマップ座標を利用し、ジオコーディング失敗による漏れを削減。
+- 詳細ページ取得を並列化（従来の逐次＋sleep から。件数上限を外しても時間が伸びない）。
 """
 
 import math
 import re
+import threading
 import time
+import unicodedata
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -37,10 +54,36 @@ MHLW_BASE   = MHLW_DOMAIN + "/znk-web"
 WORKING_DAYS = 305
 
 OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.osm.ch/api/interpreter",
-    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
+
+# v1.4: 取得の上限と並列度
+PAGE_SIZE = 20                 # ナビィ一覧の1ページあたり件数
+MAX_PAGES_DEFAULT = 40         # 一覧の取得ページ上限（= 800件）
+FETCH_WORKERS = 8              # 詳細ページの同時取得数
+DEDUP_GAP_M = 60.0             # 同名施設を「同一」とみなす最大距離
+
+# ナビィの「中心からの距離」指定コード。"00"=1km以内, "01"=5km以内, ""=指定なし。
+# ナビィ側の距離判定は施設の登録座標に基づくため、登録座標がずれている施設は
+# 本来の圏内なのに絞り込みから外れる。v1.4の「推考」フェーズでは1段広いコードで
+# 再検索し、こちらで実距離を測り直して拾い直す。
+DIST_CODES = ["00", "01", ""]
+
+
+def dist_code_for(radius_m: int) -> str:
+    return "00" if radius_m <= 1_000 else ("01" if radius_m <= 5_000 else "")
+
+
+def wider_dist_code(code: str) -> str:
+    """1段広い距離コードを返す（すでに最大なら同じものを返す）。"""
+    try:
+        i = DIST_CODES.index(code)
+    except ValueError:
+        return ""
+    return DIST_CODES[min(i + 1, len(DIST_CODES) - 1)]
 
 # kikanCd 先頭桁 → kikanKbn の推定マッピング
 KIKAN_KBN_MAP = {"1": [1, 2], "2": [2, 1], "3": [3, 2], "4": [4, 2], "5": [5, 2]}
@@ -128,6 +171,97 @@ def name_similarity(a: str, b: str) -> float:
     return len(a_chars & b_chars) / max(len(a_chars), len(b_chars))
 
 
+# ─── 施設の同一判定（v1.4: 「漏れ」対策の中核） ────────────────────────────────
+# 旧版は name_similarity()（文字集合の重なり率）>= 0.65 を「同じ施設」とみなして
+# 後から来たほうを捨てていた。この指標は文字の順序も出現回数も見ないため、
+#   「田中内科クリニック」と「中田内科クリニック」→ 1.00（別医院なのに同一扱い）
+#   「さくら薬局中央店」と「さくら薬局東町店」    → 0.8前後（別店舗なのに同一扱い）
+# のように、実在する別施設をリストから消してしまう。これが取りこぼしの主因だった。
+# v1.4では「機関コードが違えば必ず別施設」を最優先し、コードが無い相手（OSM）とだけ
+# 名前＋座標で照合する。
+_NAME_NOISE_RE  = re.compile(r"[\s　・（）()\[\]「」【】,，.。／/\-－―ー~〜]")
+_NAME_CORP_RE   = re.compile(
+    r"(医療法人社団|医療法人財団|社会医療法人|特定医療法人|医療法人|社会福祉法人|"
+    r"公益社団法人|一般社団法人|公益財団法人|一般財団法人|株式会社|有限会社|合同会社)"
+)
+
+
+def normalize_name(s: str) -> str:
+    """全角/半角・法人格・記号を落として施設名を正規化する。"""
+    s = unicodedata.normalize("NFKC", s or "")
+    s = _NAME_CORP_RE.sub("", s)
+    return _NAME_NOISE_RE.sub("", s).lower()
+
+
+def same_facility(a, b, max_gap_m: float = 60.0) -> bool:
+    """a と b が同一施設かを判定する（重複排除用）。
+
+    判定順:
+      ① 双方に機関コード（ナビィ）がある → コードの一致だけで決める。
+         別コードなら、名前がどれだけ似ていても必ず「別施設」として両方残す。
+      ② 正規化した名前が完全一致 → 座標が近い（または座標不明）なら同一。
+      ③ 片方の名前がもう片方の先頭に含まれる（「○○薬局」vs「○○薬局本町店」）
+         → 座標が {max_gap_m}m 以内のときだけ同一。
+    """
+    a_cd = getattr(a, "kikan_cd", "") or ""
+    b_cd = getattr(b, "kikan_cd", "") or ""
+    if a_cd and b_cd:
+        return a_cd == b_cd
+
+    na, nb = normalize_name(getattr(a, "name", "")), normalize_name(getattr(b, "name", ""))
+    if not na or not nb:
+        return False
+
+    a_lat, a_lon = getattr(a, "lat", None), getattr(a, "lon", None)
+    b_lat, b_lon = getattr(b, "lat", None), getattr(b, "lon", None)
+    gap = (haversine(a_lat, a_lon, b_lat, b_lon)
+           if None not in (a_lat, a_lon, b_lat, b_lon) else None)
+
+    if na == nb:
+        return gap is None or gap <= max_gap_m
+    if (na.startswith(nb) or nb.startswith(na)) and gap is not None and gap <= max_gap_m:
+        return True
+    return False
+
+
+def is_duplicate_of_any(fac, others, max_gap_m: float = 60.0) -> bool:
+    return any(same_facility(fac, o, max_gap_m) for o in others)
+
+
+# ─── 一覧ページの総件数パース（v1.4） ─────────────────────────────────────────
+# 旧版は本文中で最初に現れた「N件」を総件数として採用していた。ナビィの新HTMLでは
+# 「20件表示」のような表示件数が先に現れることがあり、その場合 total=20 と誤認して
+# 2ページ目以降を取りに行かなくなる（＝21件目以降が全部漏れる）。
+_TOTAL_PATTERNS = [
+    re.compile(r"検索結果[^0-9]{0,12}([\d,]{1,9})\s*件"),
+    re.compile(r"全\s*([\d,]{1,9})\s*件"),
+    re.compile(r"([\d,]{1,9})\s*件\s*中"),
+    re.compile(r"該当\s*([\d,]{1,9})\s*件"),
+]
+
+
+def parse_total_count(soup, n_items: int = 0) -> int:
+    """一覧ページHTMLから総件数を読む。読めない場合はこのページの件数を返す。"""
+    text = soup.get_text(" ", strip=True)
+    for rx in _TOTAL_PATTERNS:
+        m = rx.search(text)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    nums = []
+    for x in re.findall(r"([\d,]{1,9})\s*件", text):
+        try:
+            v = int(x.replace(",", ""))
+        except ValueError:
+            continue
+        if 0 < v < 1_000_000:
+            nums.append(v)
+    # 「20件表示」に引っ張られないよう、最初ではなく最大値を採用する。
+    return max(nums) if nums else n_items
+
+
 def guess_kikan_kbn(kikan_cd: str) -> List[int]:
     prefix = kikan_cd[0] if kikan_cd else "2"
     return KIKAN_KBN_MAP.get(prefix, [2, 1, 3])
@@ -194,13 +328,16 @@ def _parse_osm_pharmacy_elements(
 
 
 def search_osm_pharmacies(lat: float, lon: float, radius_m: int) -> List[PharmacyFacility]:
+    # v1.4: relation と healthcare=pharmacy / dispensing=yes を追加。
+    # 旧版は node/way の amenity=pharmacy と shop=chemist だけを見ていたため、
+    # これらのタグしか付いていない薬局が丸ごと漏れていた。
     query = f"""
-[out:json][timeout:50];
+[out:json][timeout:60];
 (
-  node["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
-  way["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
-  node["shop"="chemist"](around:{radius_m},{lat},{lon});
-  way["shop"="chemist"](around:{radius_m},{lat},{lon});
+  nwr["amenity"="pharmacy"](around:{radius_m},{lat},{lon});
+  nwr["shop"="chemist"](around:{radius_m},{lat},{lon});
+  nwr["healthcare"="pharmacy"](around:{radius_m},{lat},{lon});
+  nwr["dispensing"="yes"](around:{radius_m},{lat},{lon});
 );
 out center;
 """
@@ -213,13 +350,15 @@ out center;
 
 
 def search_osm_medical(lat: float, lon: float, radius_m: int) -> List[MedFacility]:
+    # v1.4: 歯科（amenity=dentist）が旧クエリの列挙から漏れていた。歯科も処方箋の
+    # 発行元なので追加する。healthcare=yes を除外していたのもやめた（除外すると
+    # 「healthcare=yes しか付いていない実在の診療所」が丸ごと落ちるため）。
+    # 薬局の除外は下のタグ判定で行う。relation にも対応（nwr）。
     query = f"""
-[out:json][timeout:40];
+[out:json][timeout:60];
 (
-  node["amenity"~"^(clinic|hospital|doctors|medical_centre)$"](around:{radius_m},{lat},{lon});
-  way["amenity"~"^(clinic|hospital|doctors|medical_centre)$"](around:{radius_m},{lat},{lon});
-  node["healthcare"]["healthcare"!~"^(pharmacy|chemist|dispensary|yes)$"](around:{radius_m},{lat},{lon});
-  way["healthcare"]["healthcare"!~"^(pharmacy|chemist|dispensary|yes)$"](around:{radius_m},{lat},{lon});
+  nwr["amenity"~"^(clinic|hospital|doctors|dentist|medical_centre)$"](around:{radius_m},{lat},{lon});
+  nwr["healthcare"]["healthcare"!~"^(pharmacy|chemist|dispensary)$"](around:{radius_m},{lat},{lon});
 );
 out center;
 """
@@ -520,7 +659,8 @@ def _extract_outpatient_from_table(table) -> Optional[int]:
 
 def _parse_outpatients_from_stats_table(soup: BeautifulSoup) -> Optional[int]:
     for item_div in soup.find_all("div", class_="item"):
-        h3 = item_div.find("h3")
+        # v1.4: ナビィのHTML変更で見出しが h3 → h2 になったため両対応にする。
+        h3 = item_div.find(["h2", "h3"])
         if not h3 or "患者数" not in h3.get_text(strip=True):
             continue
         for table in item_div.find_all("table"):
@@ -746,16 +886,127 @@ def _parse_annual_rx_count(
 
 # ─── MHLWスクレイパー ──────────────────────────────────────────────────────────
 class MHLWScraper:
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja-JP,ja;q=0.9",
+    }
+
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ja-JP,ja;q=0.9",
-        })
+        self.session = self._new_session()
         self._ready = False
+        # v1.4: 詳細ページの並列取得用。requests.Session はスレッド安全ではないので
+        # スレッドごとに独立したSessionを持ち、Cookieだけ共有する。
+        self._local = threading.local()
+        self._cache: Dict[str, Optional[str]] = {}
+        self._cache_lock = threading.Lock()
+        # 直近の検索で取りこぼしが起きたかの記録（UIの「取りこぼし診断」用）
+        self.last_warnings: List[str] = []
+
+    @classmethod
+    def _new_session(cls) -> requests.Session:
+        sess = requests.Session()
+        sess.headers.update(cls._HEADERS)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        return sess
+
+    def _sess(self) -> requests.Session:
+        """このスレッド専用のSessionを返す（Cookieはメインと共有）。
+
+        ナビィは検索結果をセッションに紐づけて保持するため、別Cookieのセッションから
+        一覧ページ(S2400)を叩くと結果が取れない。
+        """
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = self._new_session()
+            sess.cookies = self.session.cookies
+            self._local.session = sess
+        return sess
+
+    def _get_html(self, url: str, timeout: int = 12) -> Optional[str]:
+        """詳細ページHTMLをキャッシュ付きで取得する（同じURLは1回しか取りに行かない）。"""
+        with self._cache_lock:
+            if url in self._cache:
+                return self._cache[url]
+        html: Optional[str] = None
+        try:
+            r = self._sess().get(url, timeout=timeout)
+            if r.status_code == 200:
+                html = r.text
+        except Exception:
+            html = None
+        with self._cache_lock:
+            if len(self._cache) > 4000:
+                self._cache.clear()
+            self._cache[url] = html
+        return html
+
+    # ── 一覧HTMLの読み取り（ナビィのHTML変更に強い形にした） ──────────────────
+    @staticmethod
+    def _find_name_link(item):
+        """一覧itemから施設名リンクを取得する。
+
+        v1.4: ナビィのHTML変更(2026-07頃)で施設名の見出しが <h3 class="name"> から
+        <h2 class="name"> に変わった。h2/h3の両対応にしたうえで、見出しタグが
+        さらに変わっても拾えるよう「kikanCd を含むリンクを直接探す」
+        フォールバックを付けてある。
+        """
+        head = item.find(["h2", "h3", "h4"], class_="name")
+        if head:
+            link = head.find("a", href=True)
+            if link:
+                return link
+        head = item.find(["h2", "h3", "h4"])
+        if head:
+            link = head.find("a", href=True)
+            if link and "kikanCd" in (link.get("href") or ""):
+                return link
+        return item.select_one('a[href*="kikanCd"]')
+
+    @staticmethod
+    def _extract_maplink_coords(item):
+        """一覧itemのGoogleマップリンク(data-url="...maps?q=lat,lon")から座標を抽出する。
+
+        新HTMLでは一覧に座標が埋め込まれる。これを使うと住所のジオコーディングが
+        不要になり、「住所は取れたが座標にできず商圏判定からこぼれる」漏れが減る。
+        """
+        for a in item.find_all("a"):
+            for attr in ("data-url", "href"):
+                m = re.search(r"q=(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)", a.get(attr, "") or "")
+                if m:
+                    lat, lon = float(m.group(1)), float(m.group(2))
+                    if 24.0 <= lat <= 46.0 and 122.0 <= lon <= 154.0:
+                        return lat, lon
+        return None
+
+    def _collect_pages(self, page_fn, parse_fn, max_pages: int):
+        """1ページ目で総件数を確定し、必要なページ数だけ並列で取得する。
+
+        v1.4: 旧版は max_pages を固定の小さな値（薬局8=160件 / 医療機関6=120件）で
+        打ち切り、しかもそれを画面に一切出していなかった。件数の多いエリアでは
+        ここで静かに切り捨てが起き、目視で見つかる「漏れ」になっていた。
+        """
+        results: List = []
+        total = 0
+        first = page_fn(0)
+        if first:
+            items, total = parse_fn(first)
+            results.extend(items)
+        if not results:
+            return results, total
+        need_pages = math.ceil(total / PAGE_SIZE) if total else 1
+        n_pages = min(max_pages, need_pages)
+        if n_pages > 1:
+            with ThreadPoolExecutor(max_workers=min(6, n_pages - 1)) as ex:
+                for html in ex.map(page_fn, range(1, n_pages)):
+                    if html:
+                        items, _ = parse_fn(html)
+                        results.extend(items)
+        return results, total
 
     def _init(self) -> bool:
         if self._ready:
@@ -772,12 +1023,14 @@ class MHLWScraper:
         lat: float, lon: float,
         radius_m: int,
         center_name: str = "",
-        max_pages: int = 8,
+        max_pages: int = MAX_PAGES_DEFAULT,
+        dist_code_override: Optional[str] = None,
     ) -> Tuple[List[PharmacyFacility], str]:
         """ナビィ薬局タブ（S2300/yakkyokuSearch）で薬局を緯度経度検索する。"""
         if not self._init():
             return [], "MHLW接続エラー"
-        dist_code = "00" if radius_m <= 1_000 else ("01" if radius_m <= 5_000 else "")
+        dist_code = (dist_code_override if dist_code_override is not None
+                     else dist_code_for(radius_m))
         cn = urllib.parse.quote(center_name or "検索地点")
         try:
             self.session.get(f"{MHLW_BASE}/juminkanja/S2300/initializeYakk", timeout=12)
@@ -813,74 +1066,68 @@ class MHLWScraper:
         except Exception as e:
             return [], f"薬局ナビィ例外: {e}"
 
-        all_ph: List[PharmacyFacility] = []
-        total = 0
-        for page in range(max_pages):
+        def _page(p: int):
             try:
-                r3 = self.session.get(
+                r = self._sess().get(
                     f"{MHLW_BASE}/juminkanja/S2400/initialize",
-                    params={"id": search_id, "page": page, "size": 20, "sortNo": 2},
+                    params={"id": search_id, "page": p, "size": PAGE_SIZE, "sortNo": 2},
                     timeout=15,
                 )
-                if r3.status_code != 200:
-                    break
-                phs, t = self._parse_pharmacy_list(r3.text)
-                if page == 0:
-                    total = t
-                if not phs:
-                    break
-                all_ph.extend(phs)
-                if len(all_ph) >= total:
-                    break
-                time.sleep(0.3)
+                return r.text if r.status_code == 200 else None
             except Exception:
-                break
+                return None
 
+        all_ph, total = self._collect_pages(_page, self._parse_pharmacy_list, max_pages)
         dist_str = f"{radius_m // 1000}km" if radius_m >= 1000 else f"{radius_m}m"
-        return all_ph, f"ナビィ薬局: {dist_str}圏内 全{total}件 / 取得{len(all_ph)}件"
+        msg = f"ナビィ薬局: {dist_str}圏内 全{total}件 / 取得{len(all_ph)}件"
+        if total > len(all_ph):
+            self.last_warnings.append(
+                f"⚠️ 薬局が全{total}件中{len(all_ph)}件しか取得できませんでした"
+                f"（ページ上限{max_pages}）。取りこぼしの可能性があります。")
+            msg += " ※取りこぼしあり"
+        return all_ph, msg
 
     def _parse_pharmacy_list(self, html: str) -> Tuple[List[PharmacyFacility], int]:
         soup = BeautifulSoup(html, "html.parser")
         results: List[PharmacyFacility] = []
-        total = 0
-        m = re.search(r"(\d{1,6})\s*件", soup.get_text())
-        if m:
-            total = int(m.group(1))
-        for item in soup.select("div.resultItems div.item"):
-            h3 = item.find("h3", class_="name")
-            if not h3:
-                continue
-            link = h3.find("a", href=True)
+        for item in soup.select("div.resultItems div.item") or soup.find_all("div", class_="item"):
+            link = self._find_name_link(item)
             if not link:
                 continue
             name = link.get_text(strip=True)
+            if not name:
+                continue
             href = link.get("href", "")
             if href.startswith("/"):
                 href = MHLW_DOMAIN + href
-            pref_cd = re.search(r"prefCd=(\d+)", href)
-            kikan_cd = re.search(r"kikanCd=(\w+)", href)
-            pref_cd  = pref_cd.group(1)  if pref_cd  else ""
-            kikan_cd = kikan_cd.group(1) if kikan_cd else ""
+            qp = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(href).query))
             raw_text = item.get_text(separator=" ", strip=True)
             addr_m = re.search(r"〒\s*[\d-]+\s+(.+?)(?:Googleマップ|$)", raw_text)
             address = addr_m.group(1).strip() if addr_m else ""
-            results.append(PharmacyFacility(
+            ph = PharmacyFacility(
                 name=name, address=address, href=href,
-                pref_cd=pref_cd, kikan_cd=kikan_cd, source="mhlw",
-            ))
-        return results, total
+                pref_cd=qp.get("prefCd", ""), kikan_cd=qp.get("kikanCd", ""),
+                source="mhlw",
+            )
+            coords = self._extract_maplink_coords(item)
+            if coords:
+                ph.lat, ph.lon = coords
+            results.append(ph)
+        return results, parse_total_count(soup, len(results))
 
     def search_medical_by_latlon(
         self,
         lat: float, lon: float,
         radius_m: int,
         center_name: str = "",
-        max_pages: int = 6,
+        max_pages: int = MAX_PAGES_DEFAULT,
+        dist_code_override: Optional[str] = None,
     ) -> Tuple[List[MedFacility], str]:
         """ナビィ S2320 → S2400 で医療機関（病院・診療所）を検索する。"""
         if not self._init():
             return [], "MHLW接続エラー"
-        dist_code = "00" if radius_m <= 1_000 else ("01" if radius_m <= 5_000 else "")
+        dist_code = (dist_code_override if dist_code_override is not None
+                     else dist_code_for(radius_m))
         try:
             self.session.get(f"{MHLW_BASE}/juminkanja/S2320/initsearch", timeout=12)
             r2 = self.session.get(
@@ -903,43 +1150,32 @@ class MHLWScraper:
         except Exception as e:
             return [], f"MHLW search 例外: {e}"
 
-        all_facs: List[MedFacility] = []
-        total = 0
-        for page in range(max_pages):
+        sep = "&" if "?" in redirect_url else "?"
+
+        def _page(p: int):
             try:
-                sep = "&" if "?" in redirect_url else "?"
-                r3 = self.session.get(
-                    f"{redirect_url}{sep}page={page}&size=20&sortNo=2", timeout=15
-                )
-                if r3.status_code != 200:
-                    break
-                facs, t = self._parse_med_list(r3.text)
-                if page == 0:
-                    total = t
-                if not facs:
-                    break
-                all_facs.extend(facs)
-                if len(all_facs) >= total:
-                    break
-                time.sleep(0.3)
+                r = self._sess().get(
+                    f"{redirect_url}{sep}page={p}&size={PAGE_SIZE}&sortNo=2", timeout=15)
+                return r.text if r.status_code == 200 else None
             except Exception:
-                break
+                return None
+
+        all_facs, total = self._collect_pages(_page, self._parse_med_list, max_pages)
         dist_str = f"{radius_m // 1000}km" if radius_m >= 1000 else f"{radius_m}m"
-        return all_facs, f"MHLW医療機関: {dist_str}圏内 全{total}件/取得{len(all_facs)}件"
+        msg = f"MHLW医療機関: {dist_str}圏内 全{total}件/取得{len(all_facs)}件"
+        if total > len(all_facs):
+            self.last_warnings.append(
+                f"⚠️ 医療機関が全{total}件中{len(all_facs)}件しか取得できませんでした"
+                f"（ページ上限{max_pages}）。取りこぼしの可能性があります。")
+            msg += " ※取りこぼしあり"
+        return all_facs, msg
 
     def _parse_med_list(self, html: str) -> Tuple[List[MedFacility], int]:
         """S2400 医療機関一覧HTMLからMedFacilityリストを生成する（hrefからpref_cd/kikan_cd/kikan_kbn抽出）。"""
         soup = BeautifulSoup(html, "html.parser")
         results: List[MedFacility] = []
-        total = 0
-        m = re.search(r"(\d{1,6})\s*件", soup.get_text())
-        if m:
-            total = int(m.group(1))
         for item in soup.find_all("div", class_="item"):
-            h3 = item.find("h3", class_="name")
-            if not h3:
-                continue
-            link = h3.find("a", href=True)
+            link = self._find_name_link(item)
             if not link:
                 continue
             name = link.get_text(strip=True)
@@ -949,14 +1185,20 @@ class MHLWScraper:
             if href.startswith("/"):
                 href = MHLW_DOMAIN + href
             qp = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(href).query))
-            pref_cd   = qp.get("prefCd", "")
-            kikan_cd  = qp.get("kikanCd", "")
-            kikan_kbn = int(qp.get("kikanKbn", "2"))
-            results.append(MedFacility(
+            try:
+                kikan_kbn = int(qp.get("kikanKbn", "2"))
+            except ValueError:
+                kikan_kbn = 2
+            fac = MedFacility(
                 name=name, source="mhlw",
-                pref_cd=pref_cd, kikan_cd=kikan_cd, kikan_kbn=kikan_kbn,
-            ))
-        return results, max(total, len(results))
+                pref_cd=qp.get("prefCd", ""), kikan_cd=qp.get("kikanCd", ""),
+                kikan_kbn=kikan_kbn,
+            )
+            coords = self._extract_maplink_coords(item)
+            if coords:
+                fac.lat, fac.lon = coords
+            results.append(fac)
+        return results, max(parse_total_count(soup, len(results)), len(results))
 
     def get_facility_detail(self, fac: MedFacility) -> bool:
         """
@@ -1192,7 +1434,6 @@ def run_analysis(
     # Step 2: OSM 薬局検索
     prog.progress(8, text="Step2: OSMから薬局を取得中…")
     t0 = time.time()
-    time.sleep(2)
     ph_osm = search_osm_pharmacies(center_lat, center_lon, radius_m)
     ph_merged: List[PharmacyFacility] = list(ph_osm)
     log.append(f"[Step2] OSM薬局: {len(ph_osm)}件取得 ({time.time()-t0:.1f}s)")
@@ -1201,7 +1442,6 @@ def run_analysis(
     prog.progress(14, text="Step3: OSMから医療機関を取得中…")
     t0 = time.time()
     med_radius = radius_m + gate_m
-    time.sleep(2)
     med_osm = search_osm_medical(center_lat, center_lon, med_radius)
     log.append(f"[Step3] OSM医療機関: {med_radius}m圏内 {len(med_osm)}件 ({time.time()-t0:.1f}s)")
     if len(med_osm) == 0:
@@ -1210,99 +1450,157 @@ def run_analysis(
     # Step 4: ナビィ薬局リスト取得 → 住所geocoding → OSMとマージ
     prog.progress(20, text="Step4: ナビィから薬局リストを取得中…")
     t0 = time.time()
+    scraper.last_warnings = []
     navvi_phs, navvi_ph_msg = scraper.search_pharmacies_by_latlon(
         center_lat, center_lon, radius_m=radius_m,
-        center_name=address[:20], max_pages=8,
+        center_name=address[:20],
     )
     log.append(f"[Step4] {navvi_ph_msg}")
-    existing_names = [p.name for p in ph_merged]
+    if not navvi_phs:
+        log.append("[Step4] ⚠️ ナビィ薬局が0件。ナビィ側の仕様変更・通信エラーの可能性があります。")
+
+    # v1.4: 重複判定を機関コード優先の厳密判定に変更（別法人・別店舗を消さない）
     added_navvi_ph = 0
-    for i, nph in enumerate(navvi_phs):
-        if i % 5 == 0:
-            prog.progress(20, text=f"Step4: ナビィ薬局 座標取得中 {i+1}/{len(navvi_phs)}件…")
-        is_dup = any(name_similarity(nph.name, en) >= 0.65 for en in existing_names)
-        if is_dup:
-            for osm_ph in ph_merged:
-                if name_similarity(nph.name, osm_ph.name) >= 0.65 and not osm_ph.pref_cd:
-                    osm_ph.pref_cd  = nph.pref_cd
-                    osm_ph.kikan_cd = nph.kikan_cd
-                    osm_ph.href     = nph.href
+    seen_ph_cd: set = set()
+    need_gc: List[PharmacyFacility] = []
+    for nph in navvi_phs:
+        if nph.kikan_cd and nph.kikan_cd in seen_ph_cd:
+            continue                                   # ページ間の重複のみ除去
+        dup = next((p for p in ph_merged if same_facility(nph, p, DEDUP_GAP_M)), None)
+        if dup is not None:
+            if not dup.pref_cd:                        # OSM側に機関コードを補完
+                dup.pref_cd, dup.kikan_cd, dup.href = nph.pref_cd, nph.kikan_cd, nph.href
             continue
-        if nph.address:
-            gc = geocoder.geocode(nph.address)
-            if gc:
-                nph.lat, nph.lon = gc
-                nph.distance_m = haversine(center_lat, center_lon, nph.lat, nph.lon)
-                if nph.distance_m > radius_m * 1.1:
-                    time.sleep(0.15)
-                    continue
-            time.sleep(0.15)
+        if nph.kikan_cd:
+            seen_ph_cd.add(nph.kikan_cd)
         ph_merged.append(nph)
-        existing_names.append(nph.name)
         added_navvi_ph += 1
+        if nph.lat is None and nph.address:
+            need_gc.append(nph)
+
+    # 一覧に座標が埋め込まれていなかったぶんだけジオコーディングする
+    for i, p in enumerate(need_gc):
+        if i % 5 == 0:
+            prog.progress(20, text=f"Step4: ナビィ薬局 座標取得中 {i+1}/{len(need_gc)}件…")
+        gc = geocoder.geocode(p.address)
+        if gc:
+            p.lat, p.lon = gc
+        time.sleep(0.15)
+
+    # 商圏外（半径の1.1倍超）だけを落とす。座標不明の薬局は落とさず残す。
+    # v1.4: 旧版は座標が取れないと商圏外扱いで消える経路があり、これも漏れの一因だった。
+    kept: List[PharmacyFacility] = []
+    dropped_far = 0
+    for p in ph_merged:
+        if p.lat is not None:
+            p.distance_m = haversine(center_lat, center_lon, p.lat, p.lon)
+            if p.distance_m > radius_m * 1.1:
+                dropped_far += 1
+                continue
+        kept.append(p)
+    ph_merged = kept
     ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
     no_coord_ph = sum(1 for p in ph_merged if p.lat is None)
     log.append(
         f"[Step4] ナビィ固有追加: {added_navvi_ph}件 合計: {len(ph_merged)}件 "
-        f"（座標なし: {no_coord_ph}件） ({time.time()-t0:.1f}s)"
+        f"（商圏外除外: {dropped_far}件 / 座標なし: {no_coord_ph}件） ({time.time()-t0:.1f}s)"
     )
+    if no_coord_ph:
+        log.append(
+            f"[Step4] ⚠️ 座標が特定できない薬局が{no_coord_ph}件あります"
+            "（門前/面の判定は「不明」になります）。"
+        )
 
     # Step 5: ナビィ医療機関リスト取得 → get_facility_detail で住所+詳細取得 → geocoding → OSMとマージ
     prog.progress(30, text="Step5: ナビィから医療機関リストを取得中…")
     t0 = time.time()
     navvi_meds, med_msg = scraper.search_medical_by_latlon(
         center_lat, center_lon, radius_m=med_radius,
-        center_name=address[:20], max_pages=6,
+        center_name=address[:20],
     )
     log.append(f"[Step5] {med_msg}")
+    if not navvi_meds:
+        log.append("[Step5] ⚠️ ナビィ医療機関が0件。ナビィ側の仕様変更・通信エラーの可能性があります。")
 
-    # 薬局名フィルター（ナビィ医療機関検索に薬局が混入する場合を除外）
+    # 薬局の混入除外。v1.4: 名前だけで判定すると「くすりの木内科クリニック」のような
+    # 実在の医院まで落ちるため、機関区分(kikanKbn=5)を主、名前を従にした。
+    # 名前判定は「医療機関らしい語」を含まない場合にのみ効かせる。
     _PHARMA_NAME_RE = re.compile(
-        r'薬局|ドラッグ|ファーマ|調剤|くすり|クスリ|drug\s*store|pharmacy', re.IGNORECASE
+        r'薬局|ドラッグ|ファーマシー|調剤|drug\s*store|pharmacy', re.IGNORECASE
     )
-    med_existing_names = [f.name for f in med_osm]
-    med_existing_kikan_cds = {f.kikan_cd for f in med_osm if f.kikan_cd}
-    med_targets = [
-        f for f in navvi_meds
-        if f.pref_cd and f.kikan_cd
-        and f.kikan_kbn != 5                          # kikanKbn=5は薬局
-        and not _PHARMA_NAME_RE.search(f.name)        # 名前ベースでも除外
-        and f.kikan_cd not in med_existing_kikan_cds
-        and not any(name_similarity(f.name, en) >= 0.65 for en in med_existing_names)
-    ][:50]
+    _MED_NAME_RE = re.compile(
+        r'医院|クリニック|診療所|病院|歯科|内科|外科|眼科|皮膚科|小児科|産婦人科|'
+        r'耳鼻|泌尿器|整形|心療|精神|リハビリ|クリニツク|医療センター|保健'
+    )
+
+    def _is_pharmacy_row(f) -> bool:
+        if f.kikan_kbn == 5:
+            return True
+        return bool(_PHARMA_NAME_RE.search(f.name)) and not _MED_NAME_RE.search(f.name)
+
+    # v1.4: 旧版の「先頭50件だけ詳細を取る」上限を撤廃した。件数の多いエリアでは
+    # 51件目以降が黙って捨てられ、目視で見つかる「漏れ」の主因になっていた。
+    seen_cd: set = set()
+    med_targets: List[MedFacility] = []
+    for f in navvi_meds:
+        if not (f.pref_cd and f.kikan_cd):
+            continue
+        if _is_pharmacy_row(f):
+            continue
+        if f.kikan_cd in seen_cd:                  # ページ間の重複のみ除去
+            continue
+        if is_duplicate_of_any(f, med_osm, DEDUP_GAP_M):
+            continue
+        seen_cd.add(f.kikan_cd)
+        med_targets.append(f)
+    log.append(f"[Step5] ナビィ医療機関の詳細取得対象: {len(med_targets)}件（上限なし）")
 
     geocode_ok, geocode_fail, detail_fail = 0, 0, 0
-    for i, nmf in enumerate(med_targets):
-        prog.progress(
-            30 + int(20 * i / max(len(med_targets), 1)),
-            text=f"Step5: 医療機関 詳細+住所取得中 {i+1}/{len(med_targets)}件: {nmf.name[:15]}…",
-        )
-        # get_facility_detail で住所取得 + 詳細データを同時取得
+    stats_lock = threading.Lock()
+    n_med = len(med_targets)
+    done = [0]
+
+    def _fetch_med(nmf):
+        nonlocal geocode_ok, geocode_fail, detail_fail
         ok = scraper.get_facility_detail(nmf)
-        if not ok:
-            detail_fail += 1
-        if nmf.address:
-            gc = geocoder.geocode(nmf.address)
+        if nmf.lat is None and nmf.address:
+            gc = geocoder.geocode(nmf.address)     # 詳細に座標が無いときだけ住所から
             if gc:
                 nmf.lat, nmf.lon = gc
-                nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
+        with stats_lock:
+            if not ok:
+                detail_fail += 1
+            if nmf.lat is not None:
                 geocode_ok += 1
             else:
                 geocode_fail += 1
-        else:
-            geocode_fail += 1
+            done[0] += 1
+            if done[0] % 3 == 0 or done[0] == n_med:
+                prog.progress(
+                    30 + int(20 * done[0] / max(n_med, 1)),
+                    text=f"Step5: 医療機関の詳細を並列取得中 {done[0]}/{n_med}件…",
+                )
+
+    if med_targets:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            list(ex.map(_fetch_med, med_targets))
+
+    for nmf in med_targets:
+        if nmf.lat is not None:
+            nmf.distance_m = haversine(center_lat, center_lon, nmf.lat, nmf.lon)
         med_osm.append(nmf)
-        med_existing_names.append(nmf.name)
-        if nmf.kikan_cd:
-            med_existing_kikan_cds.add(nmf.kikan_cd)
-        time.sleep(0.2)
 
     med_osm.sort(key=lambda x: x.distance_m or 9_999_999)
     log.append(
-        f"[Step5] 医療機関詳細+住所取得: 成功={geocode_ok}件 "
-        f"詳細失敗={detail_fail}件 geocoding失敗={geocode_fail}件 "
+        f"[Step5] 医療機関詳細+住所取得（{FETCH_WORKERS}並列）: 成功={geocode_ok}件 "
+        f"詳細失敗={detail_fail}件 座標なし={geocode_fail}件 "
         f"合計={len(med_osm)}件 ({time.time()-t0:.1f}s)"
     )
+    if geocode_fail:
+        log.append(
+            f"[Step5] ⚠️ 座標を確定できなかった医療機関が{geocode_fail}件あります。"
+            "この施設は門前判定に使われないため、近くの薬局が「面」と判定される場合があります。"
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Phase 2: 推考フェーズ（必須・スキップ不可）
@@ -1311,73 +1609,114 @@ def run_analysis(
     # Step 6: 【医療機関 漏れ確認】ナビィ再検索
     prog.progress(52, text="Step6（推考①）: 医療機関 漏れ確認中…")
     t0 = time.time()
+    # v1.4: 旧版はまったく同じ条件で再検索していたため、原理的に新しい施設は
+    # 1件も出てこなかった（時間だけを消費していた）。ここでは1段広い距離コードで
+    # 検索し、こちら側で実距離を測り直して圏内のものだけ拾い直す。
+    # ナビィの距離絞り込みは施設の登録座標に依存するため、登録座標がずれている
+    # 施設はこの「広めに取って測り直す」でしか拾えない。
     existing_med_kikan_cds = {f.kikan_cd for f in med_osm if f.kikan_cd}
-    existing_med_names     = [f.name for f in med_osm]
-    verify_meds, _ = scraper.search_medical_by_latlon(
+    wide_code = wider_dist_code(dist_code_for(med_radius))
+    verify_meds, verify_msg = scraper.search_medical_by_latlon(
         center_lat, center_lon, radius_m=med_radius,
-        center_name=address[:20], max_pages=6,
+        center_name=address[:20], dist_code_override=wide_code,
     )
-    added_med = 0
+    log.append(f"[Step6] 広域再検索（距離コード'{wide_code}'）: {verify_msg}")
+
+    add_meds: List[MedFacility] = []
     for vf in verify_meds:
-        if vf.kikan_cd and vf.kikan_cd in existing_med_kikan_cds:
-            continue
-        if any(name_similarity(vf.name, en) >= 0.65 for en in existing_med_names):
-            continue
         if not (vf.pref_cd and vf.kikan_cd):
             continue
-        ok = scraper.get_facility_detail(vf)
-        if vf.address:
+        if vf.kikan_cd in existing_med_kikan_cds:
+            continue
+        if _is_pharmacy_row(vf):
+            continue
+        if is_duplicate_of_any(vf, med_osm, DEDUP_GAP_M):
+            continue
+        existing_med_kikan_cds.add(vf.kikan_cd)
+        add_meds.append(vf)
+
+    def _fetch_verify_med(vf):
+        scraper.get_facility_detail(vf)
+        if vf.lat is None and vf.address:
             gc = geocoder.geocode(vf.address)
             if gc:
                 vf.lat, vf.lon = gc
-                vf.distance_m = haversine(center_lat, center_lon, vf.lat, vf.lon)
+
+    if add_meds:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            list(ex.map(_fetch_verify_med, add_meds))
+
+    added_med, out_of_range = 0, 0
+    for vf in add_meds:
+        if vf.lat is not None:
+            vf.distance_m = haversine(center_lat, center_lon, vf.lat, vf.lon)
+            if vf.distance_m > med_radius:      # 広めに取ったぶんを実距離で切る
+                out_of_range += 1
+                continue
         vf.source = "mhlw(推考①追加)"
         med_osm.append(vf)
-        existing_med_names.append(vf.name)
-        if vf.kikan_cd:
-            existing_med_kikan_cds.add(vf.kikan_cd)
         added_med += 1
-        time.sleep(0.2)
     log.append(
-        f"[Step6] 推考①: 医療機関 {added_med}件追加 "
-        f"（再検索{len(verify_meds)}件確認） ({time.time()-t0:.1f}s)"
+        f"[Step6] 推考①: 医療機関 {added_med}件を追加で発見 "
+        f"（広域再検索{len(verify_meds)}件を確認 / 実距離で圏外だった{out_of_range}件は除外） "
+        f"({time.time()-t0:.1f}s)"
     )
+    if added_med:
+        log.append(
+            f"[Step6] ⚠️ 通常検索で取りきれていなかった医療機関が{added_med}件ありました"
+            "（広域再検索で回収済み。source列が「推考①追加」の行です）。"
+        )
 
     # Step 7: 【薬局 漏れ確認】ナビィ再検索
     prog.progress(62, text="Step7（推考②）: 薬局 漏れ確認中…")
     t0 = time.time()
+    # v1.4: 医療機関と同じく、1段広い距離コードで検索して実距離で絞り直す。
     existing_ph_kikan_cds = {p.kikan_cd for p in ph_merged if p.kikan_cd}
-    existing_ph_names     = [p.name for p in ph_merged]
-    verify_phs, _ = scraper.search_pharmacies_by_latlon(
+    wide_ph_code = wider_dist_code(dist_code_for(radius_m))
+    verify_phs, verify_ph_msg = scraper.search_pharmacies_by_latlon(
         center_lat, center_lon, radius_m=radius_m,
-        center_name=address[:20], max_pages=8,
+        center_name=address[:20], dist_code_override=wide_ph_code,
     )
-    added_ph = 0
+    log.append(f"[Step7] 広域再検索（距離コード'{wide_ph_code}'）: {verify_ph_msg}")
+
+    add_phs: List[PharmacyFacility] = []
     for vph in verify_phs:
         if vph.kikan_cd and vph.kikan_cd in existing_ph_kikan_cds:
             continue
-        if any(name_similarity(vph.name, en) >= 0.65 for en in existing_ph_names):
+        if is_duplicate_of_any(vph, ph_merged, DEDUP_GAP_M):
             continue
-        if vph.address:
+        if vph.kikan_cd:
+            existing_ph_kikan_cds.add(vph.kikan_cd)
+        add_phs.append(vph)
+
+    for vph in add_phs:
+        if vph.lat is None and vph.address:
             gc = geocoder.geocode(vph.address)
             if gc:
                 vph.lat, vph.lon = gc
-                vph.distance_m = haversine(center_lat, center_lon, vph.lat, vph.lon)
-                if vph.distance_m > radius_m * 1.1:
-                    time.sleep(0.15)
-                    continue
             time.sleep(0.15)
+
+    added_ph, ph_out_of_range = 0, 0
+    for vph in add_phs:
+        if vph.lat is not None:
+            vph.distance_m = haversine(center_lat, center_lon, vph.lat, vph.lon)
+            if vph.distance_m > radius_m * 1.1:     # 広めに取ったぶんを実距離で切る
+                ph_out_of_range += 1
+                continue
         vph.source = "mhlw(推考②追加)"
         ph_merged.append(vph)
-        existing_ph_names.append(vph.name)
-        if vph.kikan_cd:
-            existing_ph_kikan_cds.add(vph.kikan_cd)
         added_ph += 1
     ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
     log.append(
-        f"[Step7] 推考②: 薬局 {added_ph}件追加 "
-        f"（再検索{len(verify_phs)}件確認） ({time.time()-t0:.1f}s)"
+        f"[Step7] 推考②: 薬局 {added_ph}件を追加で発見 "
+        f"（広域再検索{len(verify_phs)}件を確認 / 実距離で圏外だった{ph_out_of_range}件は除外） "
+        f"({time.time()-t0:.1f}s)"
     )
+    if added_ph:
+        log.append(
+            f"[Step7] ⚠️ 通常検索で取りきれていなかった薬局が{added_ph}件ありました"
+            "（広域再検索で回収済み。source列が「推考②追加」の行です）。"
+        )
 
     # Step 8: 【距離整合性チェック】
     prog.progress(70, text="Step8（推考③）: 距離整合性チェック中…")
@@ -1415,17 +1754,37 @@ def run_analysis(
     # Step 9: 薬局詳細ページから年間処方箋数取得
     prog.progress(74, text="Step9: 薬局詳細（年間処方箋数）を取得中…")
     t0 = time.time()
-    ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd and not p.detail_fetched][:max_detail]
-    log.append(f"[Step9] 薬局詳細取得対象: {len(ph_targets)}件")
-    for i, ph in enumerate(ph_targets):
-        prog.progress(
-            74 + int(18 * i / max(len(ph_targets), 1)),
-            text=f"Step9: 薬局詳細取得中 ({i+1}/{len(ph_targets)}): {ph.name[:20]}…",
+    all_ph_targets = [p for p in ph_merged if p.pref_cd and p.kikan_cd and not p.detail_fetched]
+    ph_targets = all_ph_targets[:max_detail]
+    log.append(f"[Step9] 薬局詳細取得対象: {len(ph_targets)}件 / 対象候補{len(all_ph_targets)}件")
+    if len(all_ph_targets) > len(ph_targets):
+        log.append(
+            f"[Step9] ⚠️ 「詳細取得件数」の設定により"
+            f"{len(all_ph_targets) - len(ph_targets)}件の薬局の処方箋数を取得していません"
+            "（薬局そのものは一覧に残ります）。サイドバーで上限を上げてください。"
         )
+    n_t = len(ph_targets)
+    done_ph = [0]
+
+    def _run_ph(ph):
         scraper.get_pharmacy_detail(ph)
-        time.sleep(0.5)
+        done_ph[0] += 1
+        if done_ph[0] % 3 == 0 or done_ph[0] == n_t:
+            prog.progress(
+                74 + int(18 * done_ph[0] / max(n_t, 1)),
+                text=f"Step9: 薬局詳細を並列取得中 {done_ph[0]}/{n_t}件…",
+            )
+
+    if ph_targets:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            list(ex.map(_run_ph, ph_targets))
+    # 詳細ページで座標が判明したぶんの距離を測り直す
+    for p in ph_merged:
+        if p.lat is not None:
+            p.distance_m = haversine(center_lat, center_lon, p.lat, p.lon)
+    ph_merged.sort(key=lambda x: x.distance_m or 9_999_999)
     fetched_ph = sum(1 for p in ph_merged if p.detail_fetched)
-    log.append(f"[Step9] 薬局詳細取得完了: {fetched_ph}件 ({time.time()-t0:.1f}s)")
+    log.append(f"[Step9] 薬局詳細取得完了（{FETCH_WORKERS}並列）: {fetched_ph}件 ({time.time()-t0:.1f}s)")
 
     # Step 10: 門前/面 判定
     prog.progress(93, text="Step10: 門前/面 判定中…")
@@ -1487,7 +1846,7 @@ with st.sidebar:
         help="薬局から医療機関までの距離がこの値以内なら「門前薬局」と判定します",
     )
     max_detail = st.slider(
-        "詳細取得件数（薬局）", min_value=5, max_value=50, value=30, step=5,
+        "詳細取得件数（薬局）", min_value=5, max_value=300, value=150, step=5,
         help="ナビィから年間処方箋数を取得する薬局の上限件数（時間に影響します）",
     )
     run_btn = st.button("検索実行", type="primary", use_container_width=True)
@@ -1752,6 +2111,25 @@ if st.session_state.med_results or st.session_state.ph_results:
 
     # ─── タブ④「📝 ログ」 ─────────────────────────────────────────────────
     with tab_log:
+        # v1.4: 「漏れているかどうか」を目視で確認する前に、機械側で言い切るための欄。
+        # 打ち切り・座標未確定・広域再検索での回収など、リストが実態より少なくなる
+        # 要因と、その回収結果をここに集約する。
+        st.subheader("🩺 取りこぼし診断")
+        alerts = [l for l in st.session_state.search_log if "⚠️" in l]
+        if alerts:
+            for a in alerts:
+                st.warning(a)
+        else:
+            st.success(
+                "取りこぼしの兆候は検出されませんでした"
+                "（ナビィの全件数ぶんを取得し、座標も全件確定しています）。"
+            )
+        st.caption(
+            "※ ここで警告が出ていない場合でも、ナビィに未登録の施設・開設直後の施設は"
+            "原理的に取得できません。気になる場合はOSM由来の行（source=osm）や、"
+            "地図タブの表示もあわせてご確認ください。"
+        )
+        st.divider()
         st.subheader("処理ログ")
         for line in st.session_state.search_log:
             st.text(line)
