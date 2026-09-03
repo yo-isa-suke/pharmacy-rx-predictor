@@ -31,6 +31,13 @@ v1.5 変更点 (2026-09-03):
   （st.stop() 由来の StopException まで誤って捕まえていたのも修正）
 - タイトルにバージョン番号を表示（クラウド版とローカル版の取り違え防止）。
 
+v1.5.1 変更点 (2026-09-03):
+- 【不具合修正・Streamlit Cloud対応】並列取得のワーカースレッド内から
+  進捗バー（st.progress）を更新していたため、新しめの Streamlit
+  （Streamlit Cloud 含む）で NoSessionContext 例外になり検索が落ちていた。
+  進捗更新をメインスレッド側（as_completed ループ）に移して解消。
+  ローカルの古い Streamlit では警告止まりだったため気づけていなかった。
+
 v1.4 変更点 (2026-08-18):
 - 【重要・不具合修正】薬局も医療機関も1件も出てこなくなっていたのを修正。
   ナビィの検索結果ページのHTML変更（施設名の見出しが h3.name → h2.name）に追随した。
@@ -57,7 +64,7 @@ import time
 import traceback
 import unicodedata
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -1179,20 +1186,20 @@ def run_search(
                 geocode_fail += 1
 
     n_med = len(med_targets)
-    done = [0]
 
-    def _run(nmf):
-        _fetch_med(nmf)
-        done[0] += 1
-        if done[0] % 3 == 0 or done[0] == n_med:
-            prog.progress(
-                62 + int(13 * done[0] / max(n_med, 1)),
-                text=f"🏥 医療機関の詳細を並列取得中 {done[0]}/{n_med}件…",
-            )
-
+    # v1.5.1: 進捗バー（prog.progress）の更新はメインスレッドで行う。
+    # ワーカースレッド内から st API を呼ぶと、新しめの Streamlit
+    # （Streamlit Cloud 含む）では NoSessionContext 例外になり検索全体が落ちる。
     if med_targets:
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-            list(ex.map(_run, med_targets))
+            futures = [ex.submit(_fetch_med, nmf) for nmf in med_targets]
+            for i, fut in enumerate(as_completed(futures), start=1):
+                fut.result()
+                if i % 3 == 0 or i == n_med:
+                    prog.progress(
+                        62 + int(13 * i / max(n_med, 1)),
+                        text=f"🏥 医療機関の詳細を並列取得中 {i}/{n_med}件…",
+                    )
 
     for nmf in med_targets:
         if nmf.lat is not None:
@@ -1221,20 +1228,18 @@ def run_search(
             "（薬局自体は一覧に残っています）。サイドバーで上限を上げてください。"
         )
     n_t = len(ph_targets)
-    done_ph = [0]
 
-    def _run_ph(ph):
-        scraper.get_pharmacy_detail(ph)
-        done_ph[0] += 1
-        if done_ph[0] % 3 == 0 or done_ph[0] == n_t:
-            prog.progress(
-                77 + int(15 * done_ph[0] / max(n_t, 1)),
-                text=f"💊 処方箋数を並列取得中 {done_ph[0]}/{n_t}件…",
-            )
-
+    # v1.5.1: こちらも進捗更新はメインスレッドで（NoSessionContext対策）
     if ph_targets:
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-            list(ex.map(_run_ph, ph_targets))
+            futures = [ex.submit(scraper.get_pharmacy_detail, ph) for ph in ph_targets]
+            for i, fut in enumerate(as_completed(futures), start=1):
+                fut.result()
+                if i % 3 == 0 or i == n_t:
+                    prog.progress(
+                        77 + int(15 * i / max(n_t, 1)),
+                        text=f"💊 処方箋数を並列取得中 {i}/{n_t}件…",
+                    )
     # 詳細ページで座標が判明したぶんの距離を再計算
     for p in ph_merged:
         if p.lat is not None:
@@ -1256,7 +1261,7 @@ def run_search(
 
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
-st.title("💊 商圏内 調剤薬局リストアップ v1.5")
+st.title("💊 商圏内 調剤薬局リストアップ v1.5.1")
 st.caption("住所と商圏半径を入力すると、圏内の調剤薬局を一覧表示します。")
 
 # ── サイドバー ────────────────────────────────────────────────────────────────
