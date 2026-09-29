@@ -1,39 +1,115 @@
 # -*- coding: utf-8 -*-
 """
-医療機関検索ツール（医療機関ファインダー） ― v4.1
+薬局 出店候補地 分析ツール  ―  v2.1
 ============================================================
-住所とゾーン境界を入力すると、圏内の医療機関の 院内/院外処方・1日外来患者数・週診療日数・診療科 を
-ゾーン別に一覧表示する。近隣薬局の門前/面と年間処方箋数も出せる。
+出店候補地（A・B・C…）をまとめて分析し、その立地で獲得できる年間処方箋枚数を、
+2つの独立した方法で見積もって比較する。
 
-v4.1 変更点 (2026-09-28): ―― 「ナビィが止まっても動く」「目視確認を差分だけにする」「外来不明に参考値」
-（薬局出店分析ツール v2.1〜v2.2 と同じ仕組みを取り込んだ）
-1. 厚労省「医療情報ネットのオープンデータ」（全国の病院・診療所・薬局、緯度経度・診療科・診療日付き、
-   半年ごと更新）を一覧の土台にした。ナビィが止まっていても一覧・距離・診療科・診療日は出せる。
-   初回にこのファイルと同じフォルダの rx_tool_data/ へ自動ダウンロードする（1〜2分・初回のみ）。
-2. ナビィ詳細ページ（外来患者数・院内外処方・処方箋数）の前回取得分を保存し、取れないときはそれを使う。
-3. 地方厚生局「コード内容別医療機関一覧表」（保険医療機関の公式名簿・毎月更新）と照合する。
-   名簿にだけある施設は自動追加、休止・名簿に無い施設は🟠、同名同住所の重複登録は1件に統合。
-   結果は「ログ・取りこぼし診断」タブに差分表として出す。
-4. 外来患者数がナビィに無い施設に「外来の参考値」と「根拠」を表示する（表示のみ・実数ではない）。
-   参考値 ＝ 常勤換算の医師数（厚生局名簿）× 同じ診療科の「医師1人あたり外来数」の中央値
-   （同じ検索の周辺施設のうち、外来数と医師数が両方分かっている施設から計算）。
-5. 詳細取得の上限（旧版は既定30件）を撤廃し、圏内の全施設の詳細を取る。並列取得＋前回取得分で高速化。
-   旧版の「ナビィ再検索＋OSM再検索」の二重確認は、公式データが土台になったため廃止した。
-6. 重複判定を「名前の似ている度合いだけ」から、機関コード優先＋名前と座標の判定に変更
-   （別の施設を同一とみなして消すことがあった）。
-7. ナビィ構造チェックをサイドバーに常時表示。Streamlit Cloud 向けにスクレイパーを利用者ごとに分けた。
-8. 使われていなかった「都道府県」選択欄と、二重ジオコーディングの「距離二重確認モード」を削除
-   （座標は公式データの登録座標を使うため不要）。
+  ① 医療機関ベース（ハフ競合按分）：周辺クリニックが出す処方箋を「近さ×強さ」で
+     競合薬局と分け合うと考える。診療科別の処方箋発行率を反映。
+  ② 集客ベース（来店客数）：店舗の来店客のうち何割が処方箋を持ち込むかで見積もる。
 
-旧版の変更履歴は medical_finder_v3.3.py を参照。
-データソース：厚労省 医療情報ネット（ナビィ）とそのオープンデータ、地方厚生局、OpenStreetMap、国土地理院。
-単体で動作します（実行には requirements.txt の依存ライブラリが必要）。
+主な機能:
+- 2トラックの予測・内訳表示、数式入りExcel(.xlsx)への書き出し
+- 商圏マップ（候補地＋周辺の医療機関・薬局。手動追加/削除/座標修正も反映）
+- 診療科別の処方箋発行率（整形外科など投薬の少ない科を反映。値は編集可）
+- 漏れた医療機関・薬局の手動追加（「➕ 追加」フォーム）／座標・実績・面門前の修正
+
+v2.1 変更点 (2026-09-28): ―― テーマは「ナビィが止まっても動く」「目視確認を差分だけにする」
+ナビィのライブ画面だけに頼る構造をやめ、公式の一括データを土台にした。
+1. 厚労省「医療情報ネットのオープンデータ」（全国の病院・診療所・歯科・薬局、
+   緯度経度付き、半年ごと更新）を土台にする。
+   ・初回に自動ダウンロードして、このファイルと同じフォルダの rx_tool_data/ に保存する。
+     以後は保存済みデータを使い、30日ごとに新しい版が出ていないか確認する。
+   ・オープンデータのIDの4桁目以降＝ナビィの機関コード（kikanCd）。
+     このため施設の突き合わせはコードの完全一致で行える（名前の揺れに左右されない）。
+   ・ナビィ検索は「オープンデータ公開後に開設した施設」を足す役割になる。
+     ナビィが止まっていても、施設リスト・座標・診療科・診療日数は出せる。
+2. ナビィ詳細ページの「前回取得分」を保存し、取得に失敗したらそれを使う。
+   外来患者数・院外処方・処方箋数（ナビィにしか無い項目）も、1度取れた施設なら
+   ナビィ停止中でも前回値で計算できる（出典に「前回取得」と日付を表示）。
+3. ナビィの構造チェックを内蔵（サイドバーに常時表示）。旧 navii_health_check.py 相当。
+   構造が変わったときに「どこが壊れたか」がツール上で分かる。
+4. 地方厚生局「コード内容別医療機関一覧表」（保険医療機関・保険薬局の公式名簿、毎月更新）
+   との突き合わせ。名簿は自動で探して取り込む（見つからない地域は手動アップロード可）。
+   ・名簿にあるのにツールのリストに無い施設 → 住所から座標を出し、圏内なら
+     「厚生局名簿のみ（要確認）」として自動でリストに追加する。
+   ・名簿で「休止」になっている施設 → 要確認として表示する。
+   ・結果は「🩺 取りこぼし診断」にまとめて表示し、目視確認をこの差分だけにする。
+5. 他ファイルへの依存なし（このファイル1つ＋ .venv で動く）。データは自動で取得・保存する。
+
+v1.4 変更点 (2026-08-18): ―― テーマは「取りこぼし（漏れ）をなくす」
+なぜ漏れていたのか、と、その対策:
+1. 静かな打ち切りが3か所あった（最大の原因）
+   ・医療機関の詳細取得が「先頭50件だけ」に固定されていた（[:50]）。
+     医療機関が50件を超えるエリアでは、51件目以降が画面にも出ず、ログにも
+     出ないまま消えていた。→ 上限を撤廃。
+   ・一覧の取得ページ数が固定（薬局8ページ=160件 / 医療機関6ページ=120件）。
+     → 総件数から必要ページ数を計算して全件取得する方式に変更。
+   ・総件数の読み取りが「本文で最初に出てくるN件」だったため、新HTMLの
+     「20件表示」を総件数と誤認し、21件目以降を取りに行かないことがあった。
+     → 「検索結果N件」「全N件」等を優先して読むよう変更。
+   いずれも、足りない場合は画面に警告を出すようにした（黙って減らさない）。
+2. 重複排除で「別の施設」まで消していた
+   旧版は name_similarity（文字集合の重なり率）が0.65以上なら同一施設として
+   後から来たほうを捨てていた。この指標は文字の順序も出現回数も見ないため、
+     「田中内科クリニック」と「中田内科クリニック」→ 類似度1.00
+     「さくら薬局中央店」と「さくら薬局東町店」    → 0.75
+   のように、実在する別施設が消えていた。→ 機関コードを最優先し、コードが
+   違えば必ず別施設として扱う判定（same_facility）に変更。
+3. 座標が取れないと商圏から消えていた
+   詳細ページのkikanKbn推定を1つ外すと住所も座標も取れず、圏内にあるのに
+   一覧から落ちていた。→ 病院/診療所の両区分を試し、落とさず残して警告する。
+4. OSM側のクエリが狭かった
+   歯科(amenity=dentist)がクエリの列挙から漏れており、relation（大型病院）も
+   対象外、healthcare=yes は明示的に除外されていた。→ すべて拾うよう修正。
+5. 「推考（念のため再検索）」が同じ条件の再検索だったため無意味だった
+   → 1段広い距離コードで検索して実距離で絞り直す方式に変更し、既定ONに戻した。
+   ナビィの距離絞り込みは施設の登録座標に依存するため、登録座標がずれている
+   施設はこの「広めに取って測り直す」でしか拾えない。
+6. 「取りこぼし診断」タブを追加
+   打ち切り・座標未確定・広域再検索での回収件数を1か所に集約して表示する。
+   目視確認の前に、まずここを見れば漏れの有無と原因が分かる。
+
+v1.3 変更点 (2026-08-12):
+- 【速度】1店舗あたりの分析時間を大幅短縮（体感 5〜10分 → 1〜2分）。
+  ・ナビィ詳細ページの取得を並列化（既定8並列。スレッドごとに独立セッション）。
+  ・取得済み詳細ページをメモリにキャッシュ（同じ施設は2度取りに行かない＝2店舗目以降が速い）。
+  ・一覧ページ（2ページ目以降）も並列取得。ループ内の固定待ち(sleep)を撤廃。
+  ・重複していた「念のため再検索」(旧Step6/7)を既定OFF化（同一条件の再検索のため成果がほぼ無く、
+    1店あたり1〜2分を消費していた）。サイドバーでONに戻せる。
+- 【外来患者数】ナビィに数字が無いのに数字が入る不具合を修正。曖昧なフォールバック
+  （任意の表から最初の数値を拾う／列数が想定外のとき末尾列を外来とみなす／年間値らしき値を
+  ÷305して1日値にする／本文テキストの緩い正規表現）をすべて廃止。
+  外来欄が空欄「－」の場合は必ず「不明」として扱い、出典に理由を残す。
+- 【フラグ】外来患者数の要確認を明示。①外来不明 ②10人/日以下 ③500人/日以上（月間・年間値の
+  混入疑い）を🔴赤字で一覧表示。しきい値はサイドバーで変更可。
+- 【Excel】「RAW_医療機関」「RAW_薬局」シートを追加（1日外来患者数・出典・フラグを含む生データ）。
+  要確認行は赤字＋赤セルで着色。
+- 【Excel】「お客様提示用」シートを追加（院外処方率・発行率・λ等の機密アサンプションを一切含まない）。
+  お客様提示用だけを別ファイルで書き出すボタンも追加。
+
+v1.2 変更点 (2026-07-29):
+- 【重要】医療機関・薬局が1件も取得できなくなる不具合を修正。
+  厚労省ナビィの検索結果ページのHTML変更（施設名タグが h3.name → h2.name）に追随。
+  h2/h3両対応＋リンク直探しフォールバックにし、今後の同種変更にも壊れにくくした。
+- ナビィ一覧に埋め込まれるようになったGoogleマップ座標を直接取得。
+  薬局の住所ジオコーディングが不要になり、Step4が高速化・座標精度も向上。
+
+v1.1 変更点:
+- 修正表（医療機関/薬局）の編集が「反映して再計算」で確実に反映されるよう修正。
+  旧版はセル編集のたびに部分再実行（st.fragment）が走り、連続入力した値が
+  巻き戻って消える／編集直後に「反映」を押しても1回目が効かないことがあった。
+  修正表を st.form で包み、編集内容をボタン押下時に一括確定する方式に変更。
+
+データソース：厚生労働省「医療情報ネット（ナビィ）」ほか（公的データ）。
+単体で動作します（実行には同梱の .venv に含まれる依存ライブラリが必要）。
 """
 import streamlit as st
 
-st.set_page_config(page_title="医療機関検索ツール v4.1", page_icon="🏥", layout="wide")
+st.set_page_config(page_title="薬局 出店候補地 分析ツール v2.1", page_icon="🏪", layout="wide")
 
-# ════════════ 共通部品（薬局出店分析ツール v2.2 と同じコード。単独で動くよう取り込み） ════════════
+# ════════════ 予測モデル／スクレイパー（260702_Prescription Analysis_v2.py より無改変で取り込み） ════════════
 # ※ 元ファイルのモジュール説明はコメント化（Streamlitのマジック表示で本文に出るのを防ぐため削除）。
 import csv
 import gzip
@@ -43,7 +119,6 @@ import math
 import os
 import re
 import sqlite3
-import statistics
 import threading
 import time
 import unicodedata
@@ -598,13 +673,11 @@ def compute_footfall_prediction(
     }
 
 
-# v2.2: osm.ch はスイス限定データ（日本の検索が「成功したのに0件」になる）ため削除。
 OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
 ]
-# python-requests の既定UAは overpass-api.de に 406 で拒否されるため、識別できるUAを付ける。
-OVERPASS_HEADERS = {"User-Agent": "PharmacySiteAnalyzer/2.2 (retail pharmacy analysis tool)"}
 
 # kikanCd 先頭桁 → kikanKbn の推定マッピング
 KIKAN_KBN_MAP = {"1": [1, 2], "2": [2, 1], "3": [3, 2], "4": [4, 2], "5": [5, 2]}
@@ -675,13 +748,6 @@ class MedFacility:
     # ── v2.1: 公式データ由来 ──
     od_op_days: Optional[float] = None     # オープンデータの週診療日数（ナビィで取れないときの控え）
     review_note: str = ""                  # 厚生局名簿との突き合わせで要確認になった理由
-    # ── v2.2: 外来患者数「不明」の参考値 ──
-    kb_doctors_ft: Optional[float] = None  # 厚生局名簿の常勤医師数
-    kb_doctors_pt: Optional[float] = None  # 厚生局名簿の非常勤医師数
-    kb_depts: str = ""                     # 厚生局名簿の診療科（略称を展開したもの）
-    ref_op: Optional[int] = None           # 外来患者数の参考値（人/日）
-    ref_op_basis: str = ""                 # 参考値の根拠
-    op_ref_used: bool = False              # 計算に参考値を採用したか
 
 
 @dataclass
@@ -705,7 +771,6 @@ class PharmacyFacility:
     raw_fields: Dict[str, str] = field(default_factory=dict)
     in_area: bool = True                   # 商圏ポリゴン内か（円形モードは常にTrue）
     review_note: str = ""                  # v2.1: 厚生局名簿との突き合わせで要確認になった理由
-    od_op_days: Optional[float] = None     # v2.2: 公式オープンデータの週営業日数
 
 
 # ─── ユーティリティ ────────────────────────────────────────────────────────────
@@ -962,8 +1027,7 @@ def _overpass_post(query: str, timeout: int = 40, retries: int = 2) -> Optional[
     for attempt in range(retries + 1):
         for url in OVERPASS_MIRRORS:
             try:
-                r = requests.post(url, data={"data": query},
-                                  headers=OVERPASS_HEADERS, timeout=timeout)
+                r = requests.post(url, data={"data": query}, timeout=timeout)
                 if r.status_code == 200:
                     return r.json()
                 if r.status_code in (429, 503):
@@ -1875,18 +1939,12 @@ def od_discover_latest() -> Optional[Tuple[str, Dict[str, str]]]:
     return date, {k: u for k, (d, u) in best.items() if d == date}
 
 
-def _read_zip_csv(content: bytes, wanted: set, chunksize: Optional[int] = None):
-    """zip内のCSVを必要な列だけ読む。chunksize を渡すと分割して読む（メモリ節約）。"""
+def _read_zip_csv(content: bytes, wanted: set) -> pd.DataFrame:
     with zipfile.ZipFile(io.BytesIO(content)) as z:
         name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
         with z.open(name) as fh:
-            if chunksize is None:
-                return pd.read_csv(fh, encoding="utf-8-sig", dtype=str,
-                                   usecols=lambda c: c in wanted)
-            parts = [c for c in pd.read_csv(fh, encoding="utf-8-sig", dtype=str,
-                                            usecols=lambda c: c in wanted,
-                                            chunksize=chunksize)]
-            return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+            return pd.read_csv(fh, encoding="utf-8-sig", dtype=str,
+                               usecols=lambda c: c in wanted)
 
 
 def od_build(date: str, urls: Dict[str, str], note=None) -> Path:
@@ -1920,10 +1978,8 @@ def od_build(date: str, urls: Dict[str, str], note=None) -> Path:
         elif f"{kind}_hours" in urls:
             if note:
                 note(f"公式オープンデータ（{kind}の診療科・診療時間）をダウンロード中…")
-            # 診療時間票は最大130MBあるため分割して読む（Streamlit Cloudのメモリ上限対策）
             h = _read_zip_csv(_http_get(urls[f"{kind}_hours"], timeout=300).content,
-                              {"ID", "診療科目名"} | {f"{d}_診療開始時間" for d in _WEEKDAYS},
-                              chunksize=200_000)
+                              {"ID", "診療科目名"} | {f"{d}_診療開始時間" for d in _WEEKDAYS})
             spec = h.groupby("ID")["診療科目名"].agg(
                 lambda s: "・".join(dict.fromkeys(x for x in s.dropna() if x)))
             day_cols = [f"{d}_診療開始時間" for d in _WEEKDAYS if f"{d}_診療開始時間" in h]
@@ -2036,7 +2092,6 @@ def od_row_to_ph(r) -> PharmacyFacility:
     return PharmacyFacility(
         name=r.name, address=r.address, pref_cd=r.pref, kikan_cd=r.kikan_cd,
         lat=float(r.lat), lon=float(r.lon), distance_m=float(r.dist), source="公式OD",
-        od_op_days=_od_op_days(r),
     )
 
 
@@ -2223,49 +2278,6 @@ def _zip_members(content: bytes) -> List[Tuple[str, bytes]]:
     return out
 
 
-# v2.2: 名簿の診療科は略称（内・小・整外・耳い…）なので、診療科判定に使えるよう展開する
-_KB_DEPT_ABBR = {
-    "内": "内科", "小": "小児科", "外": "外科", "整外": "整形外科", "形外": "形成外科",
-    "皮": "皮膚科", "眼": "眼科", "耳い": "耳鼻いんこう科", "精": "精神科", "心内": "心療内科",
-    "神": "神経科", "神内": "神経内科", "脳外": "脳神経外科", "産婦": "産婦人科", "産": "産科",
-    "婦": "婦人科", "泌": "泌尿器科", "リハ": "リハビリテーション科", "呼": "呼吸器科",
-    "呼内": "呼吸器内科", "循": "循環器科", "循内": "循環器内科", "消": "消化器科",
-    "消内": "消化器内科", "胃": "胃腸科", "肛": "こう門科", "麻": "麻酔科", "放": "放射線科",
-    "アレ": "アレルギー科", "リウ": "リウマチ科", "美外": "美容外科", "美皮": "美容皮膚科",
-    "性": "性病科", "気食": "気管食道科", "病理": "病理診断科", "臨検": "臨床検査科",
-    "救": "救急科", "歯": "歯科", "矯歯": "矯正歯科", "小歯": "小児歯科", "歯外": "歯科口腔外科",
-}
-_KB_BED_RE = re.compile(r"(一般|療養|精神|結核|感染)\s*(\d+)")
-
-
-def _kb_parse_depts(txt: str) -> Tuple[str, Optional[int]]:
-    """名簿の診療科セル（略称）を展開し、病床数（一般○床など）を合計する。"""
-    txt = txt or ""
-    beds = sum(int(m.group(2)) for m in _KB_BED_RE.finditer(txt)) or None
-    txt = _KB_BED_RE.sub(" ", txt)
-    names = []
-    for tok in re.split(r"[\s　]+", txt):
-        tok = tok.strip()
-        if not tok or tok.isdigit():
-            continue
-        full = _KB_DEPT_ABBR.get(tok, tok)
-        if full not in names:
-            names.append(full)
-    return "・".join(names), beds
-
-
-def _kb_doctor_counts(block: str) -> Tuple[Optional[float], Optional[float]]:
-    """「常　勤:　1 (医　1)」「非常勤: 3 (医 3)」から常勤・非常勤の医師数を読む。"""
-    ft = pt = None
-    m = re.search(r"(?<!非)常\s*勤\s*[:：][^（(]*[（(]\s*医\s*(\d+)", block)
-    if m:
-        ft = float(m.group(1))
-    m = re.search(r"非\s*常\s*勤\s*[:：][^（(]*[（(]\s*医\s*(\d+)", block)
-    if m:
-        pt = float(m.group(1))
-    return ft, pt
-
-
 def _kb_parse_xlsx(content: bytes, file_pref: str) -> Tuple[List[dict], str]:
     """コード内容別一覧表（Excel）を行データにする。レイアウトの細かな差に耐えるよう、
     『NN,NNNN,N』形式の保険医療機関コードのセルを起点に、その右の名称・住所を読む。"""
@@ -2301,28 +2313,14 @@ def _kb_parse_xlsx(content: bytes, file_pref: str) -> Tuple[List[dict], str]:
             addr = re.sub(r"^〒\s*[\d０-９]{3}\s*[-－ー―‐]\s*[\d０-９]{4}\s*", "", addr)
             near = " ".join(" ".join(r) for r in rows[i + 1:i + 3])
             status = "休止" if "休止" in near.split("〒")[0] else "現存"
-            # v2.2: この施設の行ブロック（次の施設の行の手前まで）から医師数・診療科・病床を読む
-            tail = []
-            for r2 in rows[i + 1:i + 8]:
-                if r2 and r2[0].isdigit():
-                    break
-                tail.append(r2)
-            block = " ".join(" ".join(r) for r in [cells] + tail)
-            ft, pt = _kb_doctor_counts(block)
-            dcol = idx + 7          # 様式共通：コードの7列右が診療科（例「内　小」「整外　リハ」）
-            dept_txt = " ".join(r[dcol] for r in [cells] + tail if len(r) > dcol and r[dcol])
-            depts, beds = _kb_parse_depts(dept_txt)
             out.append({"code": re.sub(r"\D", "", cells[idx]), "name": name,
                         "address": addr.replace("\n", " "), "status": status,
-                        "file_pref": sheet_pref, "doctors_ft": ft, "doctors_pt": pt,
-                        "kb_depts": depts, "beds": beds})
+                        "file_pref": sheet_pref})
     wb.close()
     return out, asof
 
 
-KB_COLS = ["code", "name", "address", "status", "file_pref",
-           "doctors_ft", "doctors_pt", "kb_depts", "beds"]
-KB_SCHEMA = 2      # v2.2: 医師数・診療科・病床の列を追加。古い保存分は取り直す
+KB_COLS = ["code", "name", "address", "status", "file_pref"]
 
 
 def kb_parse_file(fn: str, content: bytes, pref: Optional[str] = None,
@@ -2369,8 +2367,7 @@ def kb_ensure(pref: str, kind: str, force: bool = False) -> Tuple[Optional[pd.Da
     p, m = _kb_paths(f"pref{pref}", kind)
     meta = _read_json(m)
     msg = ""
-    if (force or not p.exists() or _is_stale(meta.get("fetched_at"), KB_RECHECK_DAYS)
-            or meta.get("schema") != KB_SCHEMA):
+    if force or not p.exists() or _is_stale(meta.get("fetched_at"), KB_RECHECK_DAYS):
         try:
             urls = kb_discover(slug, kind)
             if not urls:
@@ -2389,7 +2386,7 @@ def kb_ensure(pref: str, kind: str, force: bool = False) -> Tuple[Optional[pd.Da
                 df = df[(df["file_pref"] == "") | (df["file_pref"] == pref)]
                 if len(df):
                     meta = {"fetched_at": _now_iso(), "urls": urls, "asof": asof,
-                            "rows": len(df), "bureau": bname, "schema": KB_SCHEMA}
+                            "rows": len(df), "bureau": bname}
                     kb_store(f"pref{pref}", kind, df, meta)
                 else:
                     msg = f"{bname}の{KB_KINDS[kind]}名簿を読み取れませんでした（様式変更の可能性）"
@@ -2407,10 +2404,6 @@ def kb_ensure(pref: str, kind: str, force: bool = False) -> Tuple[Optional[pd.Da
     if not frames:
         return None, msg or f"{bname}の{KB_KINDS[kind]}名簿なし"
     df = pd.concat(frames, ignore_index=True)
-    for c in KB_COLS:                 # 古い様式の手動取込分にも列をそろえる
-        if c not in df:
-            df[c] = ""
-    df = df.fillna("")
     df = df[(df["file_pref"] == "") | (df["file_pref"] == pref)]
     return df, "・".join(parts) + (f" ※{msg}。保存済みを使用" if msg else "")
 
@@ -2501,16 +2494,6 @@ def _name_close(a: str, b: str) -> bool:
     return len(short) >= 3 and short in long_
 
 
-def duplicate_registration_groups(items: list) -> List[list]:
-    """同名・同住所で機関コードだけ違う施設のグループ（2件以上のもの）を返す。"""
-    groups: Dict[Tuple[str, str], list] = {}
-    for f in items:
-        key = (normalize_name(f.name), normalize_address(f.address))
-        if f.kikan_cd and key[0] and key[1]:
-            groups.setdefault(key, []).append(f)
-    return [g for g in groups.values() if len(g) >= 2]
-
-
 def merge_duplicate_registrations(items: list, prefer_codes: set) -> Tuple[list, List[Tuple]]:
     """同名・同住所で機関コードだけが違う施設（ナビィ／ODの重複登録）を1件にまとめる。
 
@@ -2531,38 +2514,12 @@ def merge_duplicate_registrations(items: list, prefer_codes: set) -> Tuple[list,
             continue
         i = keep_by_key[key]
         kept = out[i]
-        # 残すほうの優先順：①処方箋数（ナビィ実績）が取れている ②ナビィの検索に出てくるコード
-        f_rx = getattr(f, "annual_rx_count", None) is not None
-        k_rx = getattr(kept, "annual_rx_count", None) is not None
-        if (f_rx and not k_rx) or (f_rx == k_rx and f.kikan_cd in prefer_codes
-                                   and kept.kikan_cd not in prefer_codes):
+        if f.kikan_cd in prefer_codes and kept.kikan_cd not in prefer_codes:
             out[i] = f
             removed.append((kept, f))
         else:
             removed.append((f, kept))
     return out, removed
-
-
-def _kb_num(v) -> Optional[float]:
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return None
-    return x if x == x else None
-
-
-def _attach_kb_info(obj, e) -> None:
-    """名簿の医師数・診療科・病床を医療機関に付ける（v2.2：外来の参考値に使う）。"""
-    if not isinstance(obj, MedFacility):
-        return
-    obj.kb_doctors_ft = _kb_num(getattr(e, "doctors_ft", None))
-    obj.kb_doctors_pt = _kb_num(getattr(e, "doctors_pt", None))
-    obj.kb_depts = str(getattr(e, "kb_depts", "") or "")
-    if not obj.specialties and obj.kb_depts:
-        obj.specialties = obj.kb_depts
-    b = _kb_num(getattr(e, "beds", None))
-    if obj.beds is None and b:
-        obj.beds = int(b)
 
 
 def crosscheck_kouseikyoku(center_lat: float, center_lon: float, radius_ph: float, radius_med: float,
@@ -2640,8 +2597,6 @@ def crosscheck_kouseikyoku(center_lat: float, center_lon: float, radius_ph: floa
                             and _name_close(c["name_n"], e.name_n)), None)
             if hit is not None:
                 hit["hit"] = True
-                if hit["obj"] is not None:
-                    _attach_kb_info(hit["obj"], e)
                 if e.status == "休止" and hit["obj"] is not None:
                     hit["obj"].review_note = "厚生局名簿で『休止』"
                     res["suspended"].append({"種別": KB_KINDS[kind], "施設名": hit["obj"].name,
@@ -2681,7 +2636,6 @@ def crosscheck_kouseikyoku(center_lat: float, center_lon: float, radius_ph: floa
                                   facility_category="病院" if "病院" in e.name else "診療所",
                                   coord_source="住所ジオコーディング")
             obj.review_note = note
-            _attach_kb_info(obj, e)
             flist.append(obj)
             n_add += 1
             res["added"].append({"種別": KB_KINDS[kind], "施設名": e.name, "住所": e.address,
@@ -2716,85 +2670,7 @@ def crosscheck_kouseikyoku(center_lat: float, center_lon: float, radius_ph: floa
     return res
 
 
-# ── ⑤ 外来患者数「不明」の参考値（v2.2） ─────────────────────────────────
-REF_PT_WEIGHT_DEFAULT = 0.2   # 非常勤医師1人を常勤の何人分とみなすか
-REF_MIN_SAMPLES = 3           # 診療科ごとの中央値を使う最低件数
-REF_SKIP_BUCKETS = ("病院", "美容")   # 医師数と外来数の関係が違う／自由診療中心のため出さない
-
-
-def _doctor_fte(f, pt_w: float) -> Optional[float]:
-    ft, pt = getattr(f, "kb_doctors_ft", None), getattr(f, "kb_doctors_pt", None)
-    if ft is None and pt is None:
-        return None
-    v = (ft or 0.0) + (pt or 0.0) * pt_w
-    return v if v > 0 else None
-
-
-def _fmt_num(x: float) -> str:
-    return str(int(x)) if abs(x - round(x)) < 1e-9 else f"{x:.1f}"
-
-
-def compute_reference_outpatients(meds: list, pt_w: float = REF_PT_WEIGHT_DEFAULT
-                                  ) -> Dict[str, Tuple[int, str]]:
-    """外来患者数が不明な医療機関の参考値を出す。{facility_key: (参考値, 根拠)}
-
-    参考値 ＝ 常勤換算の医師数 × 同じ診療科の「医師1人あたり外来数」の中央値。
-    中央値は同じ分析の周辺施設のうち、外来数（ナビィ）と医師数（厚生局名簿）が
-    両方分かっている施設から取る。外部の仮定値は使わない。"""
-    samples: Dict[str, List[float]] = {}
-    allv: List[float] = []
-    ops: Dict[str, List[int]] = {}        # 実際の外来数（上限の頭打ちに使う）
-    for f in meds:
-        op = f.daily_outpatients
-        if op is None or op <= 0 or getattr(f, "op_ref_used", False):
-            continue
-        if op >= OP_HIGH_THR_DEFAULT or getattr(f, "op_flag", ""):
-            continue                      # 年間値の混入疑いなどは除く
-        b = bucket_of_med(f)
-        if b in REF_SKIP_BUCKETS:
-            continue
-        fte = _doctor_fte(f, pt_w)
-        if not fte:
-            continue
-        per = op / fte
-        samples.setdefault(b, []).append(per)
-        allv.append(per)
-        ops.setdefault(b, []).append(op)
-        ops.setdefault("*", []).append(op)
-    med_by = {b: statistics.median(v) for b, v in samples.items() if len(v) >= REF_MIN_SAMPLES}
-    all_med = statistics.median(allv) if len(allv) >= REF_MIN_SAMPLES else None
-    out: Dict[str, Tuple[int, str]] = {}
-    for f in meds:
-        if f.daily_outpatients is not None and not getattr(f, "op_ref_used", False):
-            continue
-        b = bucket_of_med(f)
-        if b in REF_SKIP_BUCKETS:
-            continue
-        if b in med_by:
-            per, n, lab, cap = med_by[b], len(samples[b]), b, max(ops[b])
-        elif all_med is not None:
-            per, n, lab, cap = all_med, len(allv), "全診療科", max(ops["*"])
-        else:
-            continue
-        fte = _doctor_fte(f, pt_w)
-        if fte:
-            ft, pt = getattr(f, "kb_doctors_ft", None) or 0, getattr(f, "kb_doctors_pt", None) or 0
-            who = f"常勤{_fmt_num(ft)}人" + (f"＋非常勤{_fmt_num(pt)}人×{pt_w:g}" if pt else "")
-            basis = f"医師{_fmt_num(fte)}人（{who}）× {lab}の中央値{per:.0f}人/医師（周辺n={n}）"
-        else:
-            fte = 1.0
-            basis = f"医師数不明→1人と仮定 × {lab}の中央値{per:.0f}人/医師（周辺n={n}）"
-        ref = max(1, int(round(fte * per)))
-        if ref > cap:
-            # 非常勤医が数十人登録されている施設などで過大にならないよう、
-            # 周辺で実際に観測された最大値で頭打ちにする
-            basis += f"＝{ref}人 → 周辺の{lab}の最大値{cap}人で頭打ち"
-            ref = cap
-        out[facility_key(f)] = (ref, basis)
-    return out
-
-
-# ── ⑥ ナビィ構造チェック（旧 navii_health_check.py を内蔵） ─────────────────
+# ── ⑤ ナビィ構造チェック（旧 navii_health_check.py を内蔵） ─────────────────
 def navii_quick_check(lat: float = 35.6644, lon: float = 138.5686) -> List[Tuple[str, str]]:
     """ナビィに実際にアクセスし、ツールの前提（API応答・一覧のHTML・詳細ページ）が
     今も成り立っているかを確認する。(判定, 内容) のリストを返す。判定は ok/ng/warn。"""
@@ -3498,8 +3374,6 @@ def run_analysis(
     od_df: Optional[pd.DataFrame] = None,
     use_kouseikyoku: bool = True,
     xcheck_out: Optional[dict] = None,
-    fetch_med_detail: bool = True,
-    detail_max_m: Optional[float] = None,
 ) -> Tuple[List[MedFacility], List[PharmacyFacility], float, float]:
     """1候補地ぶんのデータ収集。v1.3で詳細ページ取得を並列化し、重複していた再検索を任意化した。
 
@@ -3686,13 +3560,7 @@ def run_analysis(
     # v2.1: 公式ODの医療機関を土台にし、OSMはODと重複しないものだけ重ねる
     osm_only = [f for f in med_osm if not is_duplicate_of_any(f, od_med, DEDUP_GAP_M)]
     med_osm = list(od_med) + osm_only
-    # fetch_med_detail=False（薬局ファインダー等、医療機関は門前判定の座標だけ要る場合）は、
-    # 座標が既に分かっている医療機関の詳細ページを取りに行かない（大幅に速くなる）
-    # detail_max_m を渡すと、その距離より遠い医療機関の詳細は取らない（医療機関ファインダー用：
-    # ナビィの検索範囲は1km/5km単位で、表示範囲より広いことが多いため）
-    od_targets = [f for f in od_med if f.pref_cd and f.kikan_cd
-                  and (fetch_med_detail or f.lat is None)
-                  and (detail_max_m is None or f.distance_m is None or f.distance_m <= detail_max_m)]
+    od_targets = [f for f in od_med if f.pref_cd and f.kikan_cd]
     med_existing_kikan_cds = {f.kikan_cd for f in med_osm if f.kikan_cd}
     med_targets: List[MedFacility] = []
     for f in navvi_meds:
@@ -3727,19 +3595,13 @@ def run_analysis(
             else:
                 stats["gc_fail"] += 1
 
-    n_med = len(od_targets) + len(med_targets if fetch_med_detail else
-                                   [f for f in med_targets if f.lat is None])
+    n_med = len(od_targets) + len(med_targets)
 
     def _med_prog(i, item):
         prog.progress(30 + int(20 * (i + 1) / max(n_med, 1)),
                       text=f"Step5: 医療機関の詳細を並列取得中 {i+1}/{n_med}件…")
 
-    if not fetch_med_detail:
-        med_targets_fetch = [f for f in med_targets if f.lat is None]
-        log.append(f"[Step5] 医療機関の詳細取得は省略（座標のみ使用）。座標が無い{len(med_targets_fetch)}件だけ取得")
-    else:
-        med_targets_fetch = med_targets
-    _parallel(od_targets + med_targets_fetch, _fetch_med, workers, _med_prog)
+    _parallel(od_targets + med_targets, _fetch_med, workers, _med_prog)
 
     for nmf in med_targets:
         if nmf.lat is not None:
@@ -3906,10 +3768,6 @@ def run_analysis(
     _navii_codes = {x.kikan_cd for x in (list(navvi_phs) + list(navvi_meds)
                                         + list(locals().get("verify_phs", []))
                                         + list(locals().get("verify_meds", []))) if x.kikan_cd}
-    # 薬局は、重複しているコードの両方の詳細を先に取り、処方箋数が取れるほうを残す
-    _dup_ph = [p for grp in duplicate_registration_groups(ph_merged) for p in grp
-               if p.pref_cd and p.kikan_cd and not p.detail_fetched]
-    _parallel(_dup_ph, scraper.get_pharmacy_detail, workers)
     ph_merged, _rm_ph = merge_duplicate_registrations(ph_merged, _navii_codes)
     med_osm, _rm_med = merge_duplicate_registrations(med_osm, _navii_codes)
     merged_rows = [{"種別": kind, "施設名": kept.name, "住所": kept.address,
@@ -4029,8 +3887,37 @@ def run_analysis(
     return med_osm, ph_merged, center_lat, center_lon
 
 
+# ─── セッション初期化 ──────────────────────────────────────────────────────────
+_defaults = {
+    "med_results":    [],
+    "ph_results":     [],
+    "center_lat":     None,
+    "center_lon":     None,
+    "search_log":     [],
+    "last_address":   "",
+    "area_polygons":  [],
+    "collected_radius": None,
+    "searched_polygon_mode": False,
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ════════════ 画面側で使う補助関数（薬局出店分析ツール v2.2 と同じ） ════════════
+
+# ─── UI ───────────────────────────────────────────────────────────────────────
+
+# ════════════════════════════════ アプリ本体 ════════════════════════════════
+import io
+import math
+import os
+import re
+from dataclasses import replace
+
+import folium
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from streamlit_folium import st_folium
 
 
@@ -4043,6 +3930,27 @@ def _num(v):
     except (TypeError, ValueError):
         return None
     return None if f != f else f  # NaN 除外
+
+
+def _reposition(clat, clon, flat, flon, target_dist):
+    """候補地→現在地の向きを保ったまま、距離だけ target_dist(m) に補正した座標を返す。"""
+    cur = haversine(clat, clon, flat, flon)
+    if cur <= 0 or target_dist <= 0:
+        return flat, flon
+    ratio = target_dist / cur
+    return clat + (flat - clat) * ratio, clon + (flon - clon) * ratio
+
+
+def _recs_sig(recs, numfield):
+    """編集レコードの正規化シグネチャ（float揺れによる無限再実行を防ぐ比較用）。"""
+    out = []
+    for r in recs:
+        la, lo, nv = _num(r.get("lat")), _num(r.get("lon")), _num(r.get(numfield))
+        out.append(((r.get("name") or "").strip(),
+                    round(la, 6) if la is not None else None,
+                    round(lo, 6) if lo is not None else None,
+                    round(nv, 1) if nv is not None else None))
+    return out
 
 
 _EXT_CATS = ["院外のみ", "院内外どちらも", "院内のみ", "不明"]
@@ -4179,141 +4087,260 @@ def rx_category(fac):
     return "不明"
 
 
+def ext_coef(cat, ext_rate):
+    """院外区分→院外係数。院外のみ=1.0／院内外どちらも・不明=院外率／院内のみ=0。"""
+    if cat == "院外のみ":
+        return 1.0
+    if cat == "院内のみ":
+        return 0.0
+    return ext_rate
 
 
-# ════════════════════════════════ 医療機関ファインダー 本体 ════════════════════════════════
-import traceback
 
-APP_VERSION = "4.1"
+def clinic_pool(fac, cat, a, issue_rate, ext_rate, unknown_op, unknown_mode="default"):
+    """クリニックの年間院外処方（原資）＝外来×診療日数×発行率×院外係数（美容/歯科は減係数）。
+
+    外来患者数がナビィに入っていない施設（=不明）の扱いは unknown_mode で決める。
+      "default": 既定外来数(unknown_op)で推計する（従来どおり。フラグで明示）
+      "exclude": 原資0＝予測に含めない（不明を数字にしたくない場合）
+    """
+    op = fac.daily_outpatients
+    if op is None:
+        if unknown_mode == "exclude":
+            return 0.0
+        op = unknown_op  # 外来不明→既定値（下目）
+    days = (fac.weekly_op_days * 52.0
+            if (a.annual_days_mode == "weekly" and fac.weekly_op_days) else float(a.fixed_annual_days))
+    coef = ext_coef(cat, ext_rate)
+    if getattr(fac, "is_cosmetic", False):
+        coef *= a.cosmetic_factor
+    elif getattr(fac, "facility_category", "") == "歯科診療所":
+        coef *= a.dental_factor
+    ir = getattr(fac, "issue_eff", None)  # 診療科別の実効発行率（未設定なら一律値）
+    if ir is None:
+        ir = issue_rate
+    return op * days * ir * coef
 
 
-def get_scraper() -> MHLWScraper:
-    """v4.1: スクレイパーは利用者（セッション）ごとに1つ持つ（Streamlit Cloudでの混線防止）。
-    前回取得分の保存（sqlite）だけは共有する。"""
-    sc = st.session_state.get("_scraper")
-    if sc is None:
-        sc = MHLWScraper()
-        st.session_state["_scraper"] = sc
-    return sc
+
+def clinic_flag(fac, high_thr=OP_HIGH_THR_DEFAULT, low_thr=OP_LOW_THR_DEFAULT):
+    """外来患者数の要確認アラート文字列（空=正常）。v1.3で3種類のフラグを明示。
+
+      🔴 外来不明        … ナビィに外来患者数が入力されていない（既定値で推計 or 除外）
+      🔴 ○人/日 以下      … 過小・未報告の疑い（既定10人以下）
+      🔴 ○人/日 以上      … 月間・年間の数字が1日欄に入っている疑い（既定500人以上）
+      ⚠️ その他           … 年間値入力疑い・病床規模と不整合 等（_validate_outpatients）
+    """
+    flags = []
+    op = fac.daily_outpatients
+    is_hosp = (getattr(fac, "facility_category", "") == "病院") or ((getattr(fac, "beds", 0) or 0) >= 20)
+    if op is None:
+        src = getattr(fac, "daily_outpatients_source", "") or ""
+        why = "（外来欄が空欄）" if "空欄" in src else ""
+        flags.append(f"🔴 外来不明{why}")
+    else:
+        if op <= low_thr:
+            flags.append(f"🔴 外来{int(op)}人/日（{int(low_thr)}人以下・過小/未報告の疑い）")
+        if op >= high_thr:
+            note = "・病院のため妥当な可能性あり" if is_hosp else ""
+            flags.append(f"🔴 外来{int(op)}人/日（{int(high_thr)}人以上・月間/年間値の混入疑い{note}）")
+    cf = getattr(fac, "op_flag", "") or ""
+    if cf:
+        flags.append("⚠️ " + cf)
+    rn = getattr(fac, "review_note", "") or ""
+    if rn:
+        flags.append("🟠 " + rn)      # v2.1: 厚生局名簿との突き合わせ結果
+    return " / ".join(flags)
+
+
+def clinic_flag_level(fac, high_thr=OP_HIGH_THR_DEFAULT, low_thr=OP_LOW_THR_DEFAULT):
+    """"" (正常) / "warn" (⚠️のみ) / "alert" (🔴あり) を返す（赤字表示・Excel着色用）。"""
+    f = clinic_flag(fac, high_thr, low_thr)
+    if not f:
+        return ""
+    return "alert" if "🔴" in f else "warn"
+
+
+def op_display(fac):
+    """外来患者数の表示用文字列。ナビィ未入力なら必ず「不明」と表示する（v1.3）。"""
+    op = getattr(fac, "daily_outpatients", None)
+    return "不明" if op is None else f"{int(op)}"
+
+
+def resolve_edit(ed, name_col, num_disp, num_store, stored, clat, clon, cat_col=None,
+                 dept_col=None, issue_col=None):
+    """
+    編集後の data_editor 内容を、保存用レコードに解決する。行ごとに：
+      ・緯度/経度を編集した → その座標を採用
+      ・距離(m)だけ編集した → 元座標の向きを保って距離を補正
+      ・新規行 → 緯度経度があれば採用、無く距離だけなら候補地の真北に仮置き
+    """
+    smap = {s.get("_key"): s for s in stored if isinstance(s.get("_key"), str) and s.get("_key")}
+    out = []
+    for _, row in ed.iterrows():
+        name = (str(row.get(name_col)) if row.get(name_col) is not None else "").strip()
+        lat, lon = _num(row.get("緯度")), _num(row.get("経度"))
+        dist, nv = _num(row.get("距離(m)")), _num(row.get(num_disp))
+        key = row.get("_key")
+        key = key if (isinstance(key, str) and key) else None
+        s = smap.get(key)
+        if s is not None:
+            slat, slon = _num(s.get("lat")), _num(s.get("lon"))
+            sdist = (haversine(clat, clon, slat, slon)
+                     if (slat is not None and slon is not None) else None)
+            coords_edited = (slat is not None and lat is not None and lon is not None
+                             and (abs(lat - slat) > 1e-9 or abs(lon - slon) > 1e-9))
+            if coords_edited:
+                pass  # 編集した緯度経度を採用
+            elif dist is not None and sdist is not None and abs(dist - sdist) > 1:
+                lat, lon = _reposition(clat, clon, slat, slon, dist)  # 距離だけ補正
+            else:
+                lat, lon = slat, slon  # 変更なし
+        else:
+            if (lat is None or lon is None) and dist is not None and dist > 0:
+                lat, lon = clat + dist / 111000.0, clon  # 新規・距離のみ→真北に仮置き
+        if name or (lat is not None and lon is not None):
+            if not key and name:
+                key = f"name:{name}"   # 手動追加行に安定キー付与（facility_key/pharmacy_keyと一致）
+            rec = {"name": name, "lat": lat, "lon": lon, num_store: nv, "_key": key}
+            if cat_col:
+                cv = row.get(cat_col)
+                rec["cat"] = cv if cv in _EXT_CATS else "不明"
+            if dept_col:
+                dv = row.get(dept_col)
+                rec["dept"] = dv if (isinstance(dv, str) and dv in DEPT_OPTIONS) else None
+            if issue_col:
+                rec["issue_disp"] = _num(row.get(issue_col))
+            out.append(rec)
+    # キー重複を除去（data_editorの追加行が基データにも残ると二重化するのを防ぐ。先勝ち）
+    seen, deduped = set(), []
+    for rec in out:
+        k = rec.get("_key")
+        if k and k in seen:
+            continue
+        if k:
+            seen.add(k)
+        deduped.append(rec)
+    return deduped
+
+
+def effective_facilities(raw, clat, clon, label):
+    """
+    生データ＋候補地ごとの編集（座標補正・削除・手動追加）を反映した実効の医療機関/薬局リストを返す。
+    編集内容は session_state['med_edit'][label] / ['ph_edit'][label] に行レコードで保持。
+    """
+    med_edit = st.session_state.setdefault("med_edit", {})
+    ph_edit = st.session_state.setdefault("ph_edit", {})
+    if label not in med_edit:
+        med_edit[label] = [{"name": f.name, "lat": f.lat, "lon": f.lon,
+                            "op": f.daily_outpatients, "cat": rx_category(f),
+                            "dept": bucket_of_med(f), "issue": None,
+                            "_key": facility_key(f)} for f in raw["med"]]
+    if label not in ph_edit:
+        ph_edit[label] = [{"name": p.name, "lat": p.lat, "lon": p.lon,
+                           "rx": p.annual_rx_count, "_key": pharmacy_key(p)} for p in raw["ph"]]
+    raw_med_map = {facility_key(f): f for f in raw["med"]}
+    raw_ph_map = {pharmacy_key(p): p for p in raw["ph"]}
+
+    dept_rates = get_dept_rates()
+    med_eff = []
+    for r in med_edit[label]:
+        name = (r.get("name") or "").strip()
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        if not name or lat is None or lon is None:
+            continue
+        op = _num(r.get("op"))
+        base = raw_med_map.get(r.get("_key"))
+        if base is not None:
+            f = replace(base, lat=lat, lon=lon,
+                        daily_outpatients=(int(op) if op is not None else base.daily_outpatients))
+        else:
+            f = MedFacility(name=name, lat=lat, lon=lon,
+                            daily_outpatients=(int(op) if op else None),
+                            rx_summary="院外処方あり", facility_category="診療所",
+                            source="手動追加")
+        cat = r.get("cat")
+        f.rx_cat = cat if cat in _EXT_CATS else rx_category(f)
+        # 診療科バケット（手修正があれば優先）と実効発行率
+        dept = r.get("dept")
+        if dept not in dept_rates:
+            dept = bucket_of_med(f)
+        f.dept_name = dept
+        f.issue_eff = eff_issue_rate(dept, _num(r.get("issue")), dept_rates)
+        f.distance_m = haversine(clat, clon, lat, lon)
+        med_eff.append(f)
+
+    ph_eff = []
+    for r in ph_edit[label]:
+        name = (r.get("name") or "").strip()
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        if not name or lat is None or lon is None:
+            continue
+        rx = _num(r.get("rx"))
+        base = raw_ph_map.get(r.get("_key"))
+        if base is not None:
+            p = replace(base, lat=lat, lon=lon,
+                        annual_rx_count=(int(rx) if rx is not None else base.annual_rx_count))
+        else:
+            p = PharmacyFacility(name=name, address="", lat=lat, lon=lon,
+                                 annual_rx_count=(int(rx) if rx else None), source="手動追加")
+        p.distance_m = haversine(clat, clon, lat, lon)
+        ph_eff.append(p)
+    return med_eff, ph_eff
+
+
+@st.cache_resource
+def get_scraper():
+    return MHLWScraper()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_navii_check():
-    """ナビィ構造チェック。15分に1回だけ実際にアクセスする。"""
+    """ナビィ構造チェック（v2.1）。15分に1回だけ実際にアクセスする。"""
     try:
         return navii_quick_check()
     except Exception as e:
         return [("ng", f"チェック中にエラー（{type(e).__name__}）")]
 
 
-class _Prog:
-    def __init__(self, bar):
-        self.bar = bar
-
-    def progress(self, v, text=""):
-        try:
-            self.bar.progress(min(100, max(0, int(v))), text=text)
-        except Exception:
-            pass
-
-
-def extract_area_keyword(address: str) -> str:
-    m = re.search(
-        r"(東京都|大阪府|京都府|北海道)(?:(.{2,6}?[区市町村]))?|"
-        r".+?[都道府県](.{2,6}?[市区町村])",
-        address,
-    )
-    if m:
-        if m.group(1) in ("東京都", "大阪府", "京都府", "北海道"):
-            return m.group(2) or m.group(1)
-        return m.group(3) or m.group(0)
-    m2 = re.search(r"[一-鿿]{2,6}[市区町村]", address)
-    return m2.group(0) if m2 else address[:8]
-
-
-def get_zone_label(distance_m: Optional[float], zones: List[int]) -> str:
-    """距離からゾーンラベルを返す。zones は昇順のリスト。"""
-    if distance_m is None:
-        return "不明"
-    for z in zones:
-        if distance_m <= z:
-            return f"〜{z:,}m"
-    return f"{zones[-1]:,}m超"
-
-
-def assign_monzen_to_clinics(clinics: list, pharmacies: list, threshold_m: float) -> None:
-    """各医療機関に最寄りの薬局を付け、閾値以内なら門前薬局として名前・処方箋数を持たせる。"""
-    phs = [p for p in pharmacies if p.lat is not None and p.lon is not None]
-    for f in clinics:
-        f.monzen_pharmacy_name, f.monzen_pharmacy_dist_m = "なし", None
-        f.monzen_rx_count, f.monzen_rx_source = None, ""
-        if f.lat is None or f.lon is None:
-            f.monzen_pharmacy_name = "不明（座標なし）"
-            continue
-        best, best_d = None, float("inf")
-        for p in phs:
-            d = haversine(f.lat, f.lon, p.lat, p.lon)
-            if d < best_d:
-                best, best_d = p, d
-        if best is None:
-            continue
-        f.monzen_pharmacy_dist_m = best_d
-        if best_d <= threshold_m:
-            f.monzen_pharmacy_name = best.name
-            f.monzen_rx_count = best.annual_rx_count
-            f.monzen_rx_source = best.annual_rx_source
-
-
-st.title(f"🏥 医療機関検索ツール v{APP_VERSION}")
-st.caption(
-    "住所とゾーン境界を入力 → 圏内の医療機関の **院内/院外処方・外来患者数・週診療日数・診療科** をゾーン別に表示。  \n"
-    "厚労省の公式データを土台にし、ナビィが止まっていても一覧を出せます。外来患者数が不明な施設には **参考値** を表示します。  \n"
-    "データソース: **厚労省 オープンデータ・ナビィ** ＋ **地方厚生局名簿** ＋ OpenStreetMap"
-)
-
-# ── サイドバー ────────────────────────────────────────────────────────────────
+# ════════════════════════════════ サイドバー ════════════════════════════════
 with st.sidebar:
-    st.header("🔍 検索条件")
-    address_input = st.text_input(
-        "📍 住所", placeholder="例: 東京都新宿区高田馬場3丁目",
-        help="都道府県から入力してください。丁目・番地まで入力するとより正確です。",
+    st.header("共通設定")
+    radius_m = st.slider("商圏半径 (m)", 500, 5000, 3000, 100,
+                         help="スーパー商圏に準拠。全候補地に共通で使います。")
+    fetch_all_ph = st.checkbox(
+        "商圏内の薬局を全件取得（重み付けを最も正確に・ただし遅い）", value=True,
+        help="ON：商圏内の全薬局の詳細（正確な座標・実績）を取得し、門前判定・実績を最も正確にします。"
+             "OFF：近い順に指定件数だけ詳細取得（遠い競合も座標は取得済みで按分には入ります）。",
     )
-    st.subheader("📏 ゾーン境界設定")
-    num_zones = st.radio("ゾーン数", [3, 4, 5], index=1, horizontal=True,
-                         help="使用するゾーンの数を選択。不要なゾーンは非表示になります。")
-    _zone_defaults = [50, 500, 1000, 2000, 5000]
-    _zone_labels = ["ゾーン1", "ゾーン2", "ゾーン3", "ゾーン4", "ゾーン5"]
-    _zone_steps = [10, 50, 100, 100, 500]
-    _zone_maxvals = [5000, 5000, 10000, 10000, 10000]
-    raw_zone_vals = []
-    cols_row1 = st.columns(min(num_zones, 3))
-    cols_row2 = st.columns(num_zones - 3) if num_zones > 3 else []
-    all_cols = list(cols_row1) + list(cols_row2)
-    for i in range(num_zones):
-        v = all_cols[i].number_input(f"{_zone_labels[i]} (m)", min_value=10, max_value=_zone_maxvals[i],
-                                     value=_zone_defaults[i], step=_zone_steps[i])
-        raw_zone_vals.append(int(v))
-    zones = sorted(raw_zone_vals)
-    radius_m_max = zones[-1]
-    _zone_colors_icon = ["🔵", "🟢", "🟡", "🔴", "🟣"]
-    st.caption(" ／ ".join(f"{_zone_colors_icon[i]} Z{i + 1}: 〜**{z:,}m**" for i, z in enumerate(zones)))
+    if fetch_all_ph:
+        max_detail = 9999
+        st.caption("→ 商圏内の薬局を全件取得します（速度優先にしたい場合はチェックを外すと件数指定が出ます）。")
+    else:
+        max_detail = int(st.slider("詳細取得件数（薬局）", 5, 120, 30, 5,
+                                   help="ナビィから実績・座標を取る薬局の上限（多いほど正確・遅い）。"))
+    gate_m = 50
 
     st.divider()
-    st.subheader("⚙️ 詳細設定")
-    use_osm = st.checkbox("OSM で補完取得", value=False,
-                          help="OpenStreetMap で公式データ・ナビィに無い施設を補います。公式データが土台になったため"
-                               "既定OFF（OSMのサーバが遅いと最大30秒待つため）。")
-    search_pharmacies = st.checkbox("💊 近隣薬局も検索する", value=True,
-                                    help="圏内の調剤薬局を検索し、門前/面を自動判定します。"
-                                         "ナビィから年間総取扱処方箋数も取得します。")
-    pharmacy_gate_m = st.number_input("門前判定距離 (m)", min_value=10, max_value=500, value=50, step=10,
-                                      help="医療機関との距離がこの値以内の薬局を「門前薬局」と判定します。")
-    show_debug = st.checkbox("🔧 全取得フィールドを表示（デバッグ）", value=False)
+    st.subheader("⚡ 速度")
+    fetch_workers = FETCH_WORKERS_DEFAULT   # ナビィ詳細ページの同時取得数（固定・変更不要）
+    verify_pass = st.checkbox(
+        "広域再検索で漏れを回収する（推奨・少し遅い）", value=True,
+        help="1段広い距離コードでナビィをもう一度検索し、実距離で測り直して圏内の"
+             "施設を拾い直します。ナビィの距離絞り込みは施設の登録座標に依存するため、"
+             "登録座標がずれている施設はこの方式でしか拾えません。"
+             "v1.3までの『同じ条件での再検索』は結果が変わらなかったため既定OFFでしたが、"
+             "v1.4で実際に取りこぼしを回収できるようになったので既定ONにしています。",
+    )
+    use_osm = st.checkbox(
+        "OSM(OpenStreetMap)も併用する", value=True,
+        help=f"ナビィに載らない施設を補うためOSMも検索します（ナビィ検索と並行実行・最大{OSM_BUDGET_S}秒で打ち切り）。"
+             "OSMのサーバが不調で結果0件が続く場合はOFFにすると更に速くなります。",
+    )
+    st.caption(f"→ ナビィの詳細ページは{FETCH_WORKERS_DEFAULT}並列で取得し、取得済みページはメモリに"
+               f"キャッシュされます（同じエリアの2店舗目以降・再分析は更に高速）。")
 
-    st.divider()
-    run_btn = st.button("🚀 検索実行", type="primary", use_container_width=True,
-                        disabled=not address_input.strip())
-
+    # ── v2.1: データ源（ナビィの状態・公式オープンデータ・厚生局名簿） ──
     st.divider()
     st.subheader("🗂 データ源")
     with st.spinner("ナビィの状態を確認中…"):
@@ -4329,452 +4356,1403 @@ with st.sidebar:
         _hc_icon = {"ok": "✅", "ng": "❌", "warn": "⚠️"}
         for s_, m in _hc:
             st.markdown(f"{_hc_icon.get(s_, '・')} {m}")
+        st.caption("15分ごとに自動で確認します。❌が出たら、どの部分が変わったかがここで分かります。")
         if st.button("再チェック", key="navii_recheck"):
             cached_navii_check.clear()
             st.rerun()
-    use_od = st.checkbox("公式オープンデータを土台にする（推奨）", value=True,
-                         help="厚労省が公開する全国の医療機関一覧（緯度経度・診療科・診療日付き）を土台にします。")
+        st.caption(f"ナビィ詳細ページの前回取得分：{get_scraper().snapshots.count():,}ページ保存済み"
+                   "（ナビィ停止中はこれで外来患者数・処方箋数を補います）")
+
+    use_od = st.checkbox(
+        "公式オープンデータを土台にする（推奨）", value=True,
+        help="厚労省が公開する全国の病院・診療所・歯科・薬局の一覧（緯度経度付き・半年ごと更新）を"
+             "施設リストの土台にします。ナビィが止まっていてもリストと座標が出せます。",
+    )
     _odm = od_meta()
     if od_path():
         _d = str(_odm.get("date", ""))
-        st.caption(f"保存済み：{_d[:4]}/{_d[4:6]}/{_d[6:]}時点版")
+        st.caption(f"保存済み：{_d[:4]}/{_d[4:6]}/{_d[6:]}時点版（最終確認 {str(_odm.get('checked_at', ''))[:10]}）。"
+                   f"{OD_RECHECK_DAYS}日ごとに新しい版を自動確認します。")
     else:
-        st.caption("未取得です。最初の検索時に自動でダウンロードします（1〜2分・初回のみ）。")
-    use_kb = st.checkbox("厚生局名簿と突き合わせる（推奨）", value=True,
-                         help="保険医療機関の公式名簿（地方厚生局・毎月更新）と照合し、一覧に無い施設を"
-                              "自動で追加、休止・名簿に無い施設に🟠を付けます。医師数は外来の参考値にも使います。")
+        st.caption("未取得です。最初の分析時に自動でダウンロードします（1〜2分・初回のみ）。")
+    if st.button("🔄 公式データを今すぐ確認・更新", use_container_width=True):
+        _ph = st.empty()
+        with st.spinner("厚労省のオープンデータを確認中…"):
+            _, _odmsg = od_ensure(force_check=True, note=lambda t: _ph.caption(t))
+        _ph.empty()
+        st.info(_odmsg)
 
-# ── セッション初期化 ──────────────────────────────────────────────────────────
-for _k, _v in {"results": [], "pharmacies": [], "center_lat": None, "center_lon": None,
-               "search_log": [], "last_address": "", "last_zones": [50, 500, 1000, 2000, 5000],
-               "last_gate": 50, "xcheck": {}, "od_msg": "", "searched_ph": True}.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
+    use_kb = st.checkbox(
+        "厚生局名簿と突き合わせる（推奨）", value=True,
+        help="保険医療機関・保険薬局の公式名簿（地方厚生局・毎月更新）と照合し、"
+             "リストに無い施設を自動で追加、休止・名簿に無い施設に🟠を付けます。"
+             "名簿は各厚生局のサイトから自動で探して取り込み、30日ごとに更新します。",
+    )
+    _kbs = kb_status_all()
+    if _kbs:
+        st.caption("取り込み済みの名簿：" + "／".join(f"{w} {k}（{d}）" for w, k, d in _kbs))
+    with st.expander("厚生局名簿を手動で取り込む（自動で取れない地域用）"):
+        st.caption("各厚生局のサイトの「コード内容別医療機関一覧表」（Excel、またはExcelの入ったzip）を"
+                   "そのままアップロードしてください。自動取得分と合わせて照合に使います。")
+        _mpref = st.selectbox("都道府県", PREF_NAMES, index=18, key="kb_manual_pref")
+        _mkind = st.radio("名簿の種類", ["薬局", "医科"], horizontal=True, key="kb_manual_kind")
+        _mfile = st.file_uploader("名簿ファイル（.xlsx / .zip）", type=["xlsx", "zip"], key="kb_manual_file")
+        if _mfile is not None and st.button("取り込む", key="kb_manual_go"):
+            _kdf, _asof = kb_parse_file(_mfile.name, _mfile.getvalue())
+            _pc = PREF_CODE_BY_NAME[_mpref]
+            if len(_kdf):
+                _kdf["file_pref"] = _pc
+                kb_store(f"manual_{_pc}", "yakkyoku" if _mkind == "薬局" else "ika", _kdf,
+                         {"fetched_at": _now_iso(), "asof": _asof, "file": _mfile.name, "rows": len(_kdf)})
+                st.success(f"{len(_kdf):,}件を取り込みました（{_asof or '日付不明'}）。")
+            else:
+                st.error("名簿の行を読み取れませんでした。「コード内容別医療機関一覧表」のExcelか確認してください。")
 
-# ── 検索実行 ──────────────────────────────────────────────────────────────────
-if run_btn and address_input.strip():
-    log: List[str] = []
-    bar = st.progress(0, text="検索を開始しています…")
-    try:
+    st.divider()
+    st.subheader("🛒 集客ベースの前提（全候補地に共通）")
+    ff_r65 = st.number_input("65歳以上の比率（商圏の高齢化率）", 0.0, 1.0, 0.30, 0.01,
+                             help="来店客の年齢構成。会員の年齢データがあればその比率、なければ商圏の高齢化率。")
+    c1, c2 = st.columns(2)
+    ff_v65 = c1.number_input("65+ の月受診回数", 0.0, 6.0, 3.0, 0.1)
+    ff_vu65 = c2.number_input("65- の月受診回数", 0.0, 6.0, 1.3, 0.1)
+    c3, c4, c5 = st.columns(3)
+    ff_issue = c3.number_input("発行率", 0.0, 1.0, 0.8054, 0.0001, format="%.4f")
+    ff_ext = c4.number_input("院外率", 0.0, 1.0, 0.8313, 0.0001, format="%.4f")
+    ff_use = c5.number_input("利用率", 0.0, 1.0, 0.137, 0.001, format="%.3f")
+    c6, c7 = st.columns(2)
+    ff_monzen = c6.number_input("門前しきい値(m)", 0, 300, 50, 10,
+                                help="最寄りクリニックがこの距離以内の薬局は門前として自動判定→面競合から除外。")
+    ff_decay = c7.number_input("面競合の距離減衰λ(m)", 0, 3000, 1000, 100,
+                               help="遠い面競合を弱く数える。小さいほど自店シェア↑。")
+    ff_main = st.number_input(
+        "メイン薬局しきい値(枚/年・0=無効/既定)", 0, 100000, 0, 1000,
+        help="既定0＝無効。実績が大きい面薬局は“面の強豪”なので、除外せずパワー加重で強い競合として"
+             "数えます（門前かどうかは距離＝門前しきい値で判定）。門前で大量の店だけ外したい場合のみ値を入れます。",
+    )
+
+    with st.expander("⚙️ 詳細設定（ハフ按分・通常は変更不要）", expanded=False):
+        huff_lambda = st.slider(
+            "距離減衰 λ (m)", 150, 1200, 300, 50,
+            help="発行率×院外係数を入れた新原資に合わせ、地方69シード・面型106店で再較正した値"
+                 "（予測/実績 中央値0.99）。",
+        )
+        huff_boost = st.slider("門前ブースト", 1.0, 15.0, 6.0, 0.5)
+        huff_monzen_r = st.slider(
+            "門前ブースト半径 (m)", 30, 150, 50, 10,
+            help="①医療機関ベースで、クリニックからこの距離以内の薬局に門前ブーストを掛けます。"
+                 "実質“門前”が80〜100mにある場合はここを広げてください（既定50mは275店検証時の値のため、"
+                 "広げた場合は再較正が望ましい）。",
+        )
+        huff_candA = st.number_input("候補店の引力（大型店は上げる）", 0.2, 10.0, 1.0, 0.1)
+        st.caption("── 医療機関ベースの原資（外来→処方箋の換算）──")
+        med_unknown_mode_label = st.radio(
+            "外来患者数がナビィに無い施設の扱い",
+            ["既定値で推計する（フラグ表示）", "予測から除外する（原資0）"],
+            index=0, horizontal=False,
+            help="v1.3：ナビィに外来患者数が入力されていない施設は必ず『不明』と表示します。"
+                 "予測に含めるかどうかをここで選べます。",
+        )
+        med_unknown_mode = "default" if med_unknown_mode_label.startswith("既定値") else "exclude"
+        med_unknown_op = st.number_input(
+            "外来不明クリニックの既定外来数(人/日)", 0, 500, 30, 5,
+            disabled=(med_unknown_mode == "exclude"),
+            help="ナビィで外来患者数が取得できないクリニックに入れる値（未入力なので下目に設定）。",
+        )
+        st.caption("── 要確認フラグのしきい値（検証用・🔴で表示）──")
+        _t1, _t2 = st.columns(2)
+        med_low_thr = _t1.number_input(
+            "過小フラグ（人/日 以下）", 0, 100, OP_LOW_THR_DEFAULT, 1,
+            help="この人数以下なら『過小・未報告の疑い』として🔴を付けます。",
+        )
+        med_high_thr = _t2.number_input(
+            "過大フラグ（人/日 以上）", 50, 5000, OP_HIGH_THR_DEFAULT, 10,
+            help="この人数以上なら『月間・年間の数字が1日欄に入っている疑い』として🔴を付けます。"
+                 "厚労省への報告値は1日/月間/年間が混在しうるため、大きい値は要確認。",
+        )
+        st.caption("── 診療科別の処方箋発行率（①医療機関ベースの原資に使用・編集可）──")
+        _dept_rates = get_dept_rates()
+        _dr_df = pd.DataFrame([{"診療科": k, "発行率": _dept_rates.get(k, v)}
+                               for k, v in DEPT_DEFAULTS])
+        _dr_ed = st.data_editor(
+            _dr_df, hide_index=True, use_container_width=True, key="dept_rates_editor",
+            disabled=["診療科"],
+            column_config={"発行率": st.column_config.NumberColumn(
+                "発行率", min_value=0.0, max_value=1.0, step=0.01, format="%.2f")},
+        )
+        _new_dr = {}
+        for _, _rr in _dr_ed.iterrows():
+            _k = _rr["診療科"]
+            _v = _num(_rr["発行率"])
+            _new_dr[_k] = _v if _v is not None else _dept_rates.get(_k, DEFAULT_ISSUE)
+        if _new_dr != _dept_rates:
+            st.session_state["dept_rates"] = _new_dr   # 保存のみ（この後の再計算で即反映・st.rerun不要）
+        st.caption("整形外科0.55/リハビリ0.20/内科系0.90 等（受診のうち投薬に至る割合）。"
+                   "診療科は施設ごとに医療機関表でも変更できます。大病院は一律で『病院』値。")
+        st.caption("根拠：日医総研 診療所の診療科特性（厚労省 社会医療診療行為別統計より作成）の"
+                   "診療科別・入院外・投薬の点数構成比（2020）＝内科20.4%/皮膚22.0%/整形12.8%/眼科11.8% 等。"
+                   "件数加重平均≒0.80で全体水準は較正値と整合。")
+        st.caption("※ ①の原資 = 外来×診療日数×**診療科別発行率**×院外係数"
+                   "（院外のみ1.0／院内外どちらも=院外率/院内のみ0）。"
+                   f"②集客ベースの発行率は上の {float(ff_issue):.4f}（館全体の平均）を使用。")
+
+    st.caption("※ サイドバーや面/門前を変えると、再検索なしで比較表・Excelが即更新されます。")
+
+
+def make_fp(uni):
+    return FootfallParams(
+        enabled=(uni > 0),
+        unique_customers_monthly=float(uni), ratio_65plus=float(ff_r65),
+        visits_month_65plus=float(ff_v65), visits_month_under65=float(ff_vu65),
+        issue_rate=float(ff_issue), external_rate=float(ff_ext), use_rate=float(ff_use),
+        menkata_monzen_dist=float(ff_monzen), menkata_main_rx=float(ff_main),
+        competitor_decay_m=float(ff_decay),
+    )
+
+
+def make_hp():
+    return HuffParams(lambda_m=float(huff_lambda), monzen_boost=float(huff_boost),
+                      candidate_attractiveness=float(huff_candA), monzen_radius=float(huff_monzen_r))
+
+
+# ── ハフの取り分内訳（クリニック1行ずつ・自店の重み/競合の重み合計を明示） ─────────
+def huff_breakdown(med, ph, clat, clon, hp, a, issue_rate, ext_rate, unknown_op,
+                   unknown_mode="default"):
+    comps = []
+    for p in ph:
+        if p.lat is None or p.lon is None:
+            continue
+        ak = _pharmacy_attractiveness(p, hp.national_avg_rx) if hp.weight_by_power else 1.0
+        comps.append((p.lat, p.lon, ak))
+
+    def bw(d, aa):
+        v = math.exp(-d / hp.lambda_m)
+        if d <= hp.monzen_radius:
+            v *= hp.monzen_boost
+        return aa * v
+
+    rows = []
+    for f in med:
+        if f.lat is None or f.lon is None or not getattr(f, "in_area", True):
+            continue
+        d_self = haversine(clat, clon, f.lat, f.lon)
+        if d_self > hp.reach_m:
+            continue
+        cat = getattr(f, "rx_cat", None) or rx_category(f)
+        pool = clinic_pool(f, cat, a, issue_rate, ext_rate, unknown_op, unknown_mode)
+        if pool <= 0:
+            continue
+        self_w = bw(d_self, hp.candidate_attractiveness)
+        den = self_w
+        for (plat, plon, ak) in comps:
+            dk = haversine(plat, plon, f.lat, f.lon)
+            if dk <= hp.reach_m:
+                den += bw(dk, ak)
+        share = self_w / den if den > 0 else 0.0
+        rows.append({"clinic": f.name, "key": facility_key(f), "dist": d_self, "pool": pool,
+                     "dept": getattr(f, "dept_name", "その他"),
+                     "issue": getattr(f, "issue_eff", issue_rate),
+                     "self_w": self_w, "comp_w": den - self_w,
+                     "share": share, "captured": pool * share})
+    rows.sort(key=lambda r: r["captured"], reverse=True)
+    return rows
+
+
+# ── 生データ＋現在の設定/手修正から、両トラックを算出（再検索なしで即再計算） ──────
+def compute_candidate(raw):
+    clat, clon, uni = raw["clat"], raw["clon"], raw["uni"]
+    label = raw["label"]
+    a = PredictionAssumptions()
+    hp = make_hp()
+    # 座標補正・削除・手動追加を反映した実効の医療機関/薬局リスト（①②の両方に効く）
+    med, ph = effective_facilities(raw, clat, clon, label)
+    # 周知率（接触率）：館の来店客数のうち、その薬局に接触・到達する割合。手修正が優先。
+    exposure = float(st.session_state.get("exp_multi", {}).get(label, raw.get("exposure", 1.0)))
+    eff_uni = uni * exposure
+    fp = make_fp(eff_uni)
+    hb = huff_breakdown(med, ph, clat, clon, hp, a,
+                        float(ff_issue), float(ff_ext), float(med_unknown_op),
+                        unknown_mode=med_unknown_mode)
+    med_total = sum(r["captured"] for r in hb)
+    classified = classify_menkata(ph, med, clat, clon,
+                                  monzen_dist=fp.menkata_monzen_dist,
+                                  main_rx_threshold=fp.menkata_main_rx, reach_m=hp.reach_m)
+    override = st.session_state.get("mk_multi", {}).get(label, {})
+    cpow, cn, cexc = footfall_competitor_power(classified, override, fp.competitor_decay_m,
+                                               hp.national_avg_rx)
+    foot = compute_footfall_prediction(fp, cpow)
+    hi, lo = float(med_high_thr), float(med_low_thr)
+    flags = {facility_key(f): clinic_flag(f, hi, lo) for f in med}
+    n_alert = sum(1 for f in med if clinic_flag_level(f, hi, lo) == "alert")
+    n_unknown_op = sum(1 for f in med if f.daily_outpatients is None)
+    return {
+        "label": label, "name": raw["name"], "addr": raw["addr"],
+        "uni": uni, "exposure": exposure, "eff_uni": eff_uni,
+        "flags": flags, "n_alert": n_alert, "n_unknown_op": n_unknown_op,
+        "thr_hi": hi, "thr_lo": lo,
+        "med": med, "ph": ph, "clat": clat, "clon": clon, "hp": hp, "fp": fp,
+        "huff_rows": hb, "med_total": med_total, "classified": classified, "override": override,
+        "comp_power": cpow, "comp_n": cn, "comp_excluded": cexc,
+        "foot_total": (foot["total"] if foot else None), "foot": foot,
+    }
+
+
+# ════════════════════════════════ 商圏マップ ════════════════════════════════
+def _med_color(f):
+    cat = getattr(f, "facility_category", "") or ""
+    if getattr(f, "is_cosmetic", False):
+        return "purple"
+    if "病院" in cat and "診療所" not in cat:
+        return "darkblue"
+    return "blue"
+
+
+def build_map(c, radius_m):
+    """候補地＋商圏円＋周辺の医療機関/薬局を1枚に描く（スクショ用）。
+    描画は実効リスト c['med']/c['ph'] を使うので、手動追加・削除・座標修正がそのまま反映される。"""
+    clat, clon = c["clat"], c["clon"]
+    m = folium.Map(location=[clat, clon], zoom_start=15, control_scale=True, tiles="OpenStreetMap")
+    folium.Circle([clat, clon], radius=float(radius_m), color="#0F766E", weight=2,
+                  fill=True, fill_color="#0F766E", fill_opacity=0.05,
+                  tooltip=f"商圏 {int(radius_m)}m").add_to(m)
+    folium.Marker(
+        [clat, clon], tooltip=f"候補地 {c['label']}",
+        popup=folium.Popup(
+            f"<b>候補地 {c['label']}</b><br>{c['name'] or ''}<br>{c['addr']}", max_width=260),
+        icon=folium.Icon(color="red", icon="star", prefix="fa")).add_to(m)
+
+    for f in c["med"]:
+        if f.lat is None or f.lon is None:
+            continue
+        d = round(haversine(clat, clon, f.lat, f.lon))
+        # 要確認（🔴）の施設はマーカーも赤にして見落としを防ぐ（v1.3）
+        op = f.daily_outpatients
+        days, hours = parse_open_schedule(getattr(f, "raw_fields", None))
+        sched = (f"<br>診療日: {days}" if days else "") + (f"<br>診療時間: {hours}" if hours else "")
+        fl = c.get("flags", {}).get(facility_key(f), "")
+        fl_html = (f"<br><span style='color:#B91C1C;font-weight:700'>{fl}</span>") if fl else ""
+        html = (f"<b>{f.name}</b><br>距離 {d}m<br>"
+                f"診療科: {getattr(f, 'dept_name', '—')}"
+                f"（発行率 {getattr(f, 'issue_eff', 0.0):.2f}）<br>"
+                f"外来: {'不明' if op is None else int(op)} 人/日<br>"
+                f"院外区分: {getattr(f, 'rx_cat', '—')}{sched}{fl_html}")
+        mcolor = "red" if "🔴" in fl else _med_color(f)
+        folium.Marker([f.lat, f.lon], tooltip=(("🔴 " if "🔴" in fl else "") + f.name),
+                      popup=folium.Popup(html, max_width=280),
+                      icon=folium.Icon(color=mcolor, icon="plus", prefix="fa")).add_to(m)
+
+    menkata = {cl["key"]: c["override"].get(cl["key"], cl["auto_menkata"])
+               for cl in c["classified"]}
+    for p in c["ph"]:
+        if p.lat is None or p.lon is None:
+            continue
+        d = round(haversine(clat, clon, p.lat, p.lon))
+        is_men = menkata.get(pharmacy_key(p), True)
+        rx = p.annual_rx_count
+        days, hours = parse_open_schedule(getattr(p, "raw_fields", None))
+        sched = (f"<br>開局日: {days}" if days else "") + (f"<br>開局時間: {hours}" if hours else "")
+        html = (f"<b>{p.name}</b><br>距離 {d}m<br>"
+                f"区分: {'面' if is_men else '門前'}<br>"
+                f"実績: {int(rx) if rx else '—'} 枚/年{sched}")
+        folium.Marker([p.lat, p.lon], tooltip=p.name,
+                      popup=folium.Popup(html, max_width=250),
+                      icon=folium.Icon(color=("green" if is_men else "orange"),
+                                       icon="medkit", prefix="fa")).add_to(m)
+
+    legend = (
+        '<div style="position:fixed;bottom:22px;left:22px;z-index:9999;background:white;'
+        'padding:9px 12px;border:1px solid #B9C4C0;border-radius:8px;font-size:12px;'
+        'line-height:1.7;box-shadow:0 1px 4px rgba(0,0,0,.15)">'
+        '<b>凡例</b><br>'
+        '<span style="color:#d63e3e">★</span> 候補地&nbsp;&nbsp;'
+        '<span style="color:#0F766E">◯</span> 商圏<br>'
+        '<span style="color:#3a87d6">●</span> 診療所&nbsp;'
+        '<span style="color:#1b3a7a">●</span> 病院&nbsp;'
+        '<span style="color:#9b3bd6">●</span> 美容<br>'
+        '<span style="color:#2ca02c">●</span> 薬局(面)&nbsp;'
+        '<span style="color:#e8820e">●</span> 薬局(門前)<br>'
+        '<span style="color:#d63e3e">●</span> <b>要確認</b>（外来不明/過小/過大）</div>')
+    m.get_root().html.add_child(folium.Element(legend))
+    return m
+
+
+# ════════════════════════════════ 数式入りExcel ════════════════════════════════
+_HDR = Font(bold=True, color="FFFFFF")
+_HDR_FILL = PatternFill("solid", fgColor="0F766E")
+_HDR_FILL2 = PatternFill("solid", fgColor="B45309")
+_INP_FILL = PatternFill("solid", fgColor="FFF7E0")   # 編集できる入力＝薄い黄色
+_CALC_FILL = PatternFill("solid", fgColor="EEF2F1")  # 自動計算＝薄いグレー
+_BOLD = Font(bold=True)
+
+
+def _sheet_name(label):
+    # Excelのシート名で使えない文字（' も含む）を除去し20文字に丸める
+    return re.sub(r"[\\/*?:\[\]']", "_", str(label))[:20] or "_"
+
+
+def _assign_sheet_suffixes(results):
+    """候補地ごとに一意なシート名サフィックスを割り当てる（ラベル重複・長さ切詰めでの衝突を防止）。
+    集客_/医療機関_ シートとサマリーの参照が必ず同じ実在シートを指すようにする。"""
+    used = set()
+    for r in results:
+        base = _sheet_name(r["label"])
+        name, i = base, 2
+        while name in used:
+            name = f"{base[:16]}_{i}"
+            i += 1
+        used.add(name)
+        r["_suf"] = name
+
+
+def _build_footfall_sheet(wb, r):
+    fp = r["fp"]
+    ws = wb.create_sheet(f"集客_{r['_suf']}")
+    ws["A1"] = f"② 集客ベース（来店客数）  {r['label']}  {r['name']}"
+    ws["A1"].font = Font(bold=True, size=12)
+    ws["A2"] = "【黄色のセルは編集できます。編集すると下の「獲得」が自動で再計算されます】"
+    ws["A2"].font = Font(italic=True, size=9, color="B45309")
+    # 入力（B3..B12）※B5=有効客数は自動計算
+    ws.cell(row=3, column=1, value="館の来店客数（月間）")
+    ws.cell(row=3, column=2, value=r["uni"]).fill = _INP_FILL
+    ws.cell(row=4, column=1, value="周知率（接触率）")
+    ws.cell(row=4, column=2, value=r["exposure"]).fill = _INP_FILL
+    ws.cell(row=5, column=1, value="有効客数 ＝ 来店客数 × 周知率")
+    ec = ws.cell(row=5, column=2, value="=B3*B4")
+    ec.fill = _CALC_FILL
+    ec.font = _BOLD
+    inputs = [
+        ("65歳以上の比率", fp.ratio_65plus), ("65+ 月受診回数", fp.visits_month_65plus),
+        ("65- 月受診回数", fp.visits_month_under65), ("処方箋発行率", fp.issue_rate),
+        ("院外処方率", fp.external_rate), ("当該薬局利用率", fp.use_rate),
+        ("面競合の距離減衰λ(m)", fp.competitor_decay_m),
+    ]  # B6..B12
+    for k, (lab, val) in enumerate(inputs):
+        rr = 6 + k
+        ws.cell(row=rr, column=1, value=lab)
+        ws.cell(row=rr, column=2, value=val).fill = _INP_FILL
+    last_comp = max(22, 21 + len(r["classified"]))   # 競合行の実際の最終行（478件上限を撤廃）
+    computed = [
+        ("年間受診延べ(回)", "=(B5*B6*B7+B5*(1-B6)*B8)*12"),
+        ("院外処方プール(枚)", "=B14*B9*B10"),
+        ("面競合の実効パワー", f"=SUM(E22:E{last_comp})"),
+        ("シェア", "=B11/(1+B16)"),
+        ("獲得（年間・枚）", "=B15*B17"),
+        ("獲得（月間・枚）", "=B18/12"),
+    ]  # B14..B19
+    for k, (lab, f) in enumerate(computed):
+        rr = 14 + k
+        ws.cell(row=rr, column=1, value=lab)
+        c = ws.cell(row=rr, column=2, value=f)
+        c.fill = _CALC_FILL
+        if rr in (18, 19):
+            c.font = _BOLD
+    for j, htxt in enumerate(["競合薬局名", "候補地から(m)", "実績(枚)", "面=1/門前=0", "重み(自動)"], start=1):
+        c = ws.cell(row=21, column=j, value=htxt)
+        c.font = _HDR
+        c.fill = _HDR_FILL
+    for k, cl in enumerate(r["classified"]):
+        rr = 22 + k
+        eff = r["override"].get(cl["key"], cl["auto_menkata"])
+        ws.cell(row=rr, column=1, value=cl["name"])
+        ws.cell(row=rr, column=2, value=round(cl["d_cand"])).fill = _INP_FILL
+        ws.cell(row=rr, column=3, value=int(cl["rx"]) if cl["rx"] else 0).fill = _INP_FILL
+        ws.cell(row=rr, column=4, value=(1 if eff else 0)).fill = _INP_FILL
+        # λ(=$B$12)が0のときは距離減衰なし（＝重み1.0）。Pythonの footfall_competitor_power と一致させ #DIV/0! を防ぐ
+        ws.cell(row=rr, column=5,
+                value=f"=IF(D{rr}=1,IF(C{rr}>0,C{rr}/12000,1)*IF($B$12>0,EXP(-B{rr}/$B$12),1),0)").fill = _CALC_FILL
+    for col, w in zip("ABCDE", [30, 14, 12, 14, 14]):
+        ws.column_dimensions[col].width = w
+
+
+def _build_medical_sheet(wb, r):
+    hp = r["hp"]
+    ws = wb.create_sheet(f"医療機関_{r['_suf']}")
+    ws["A1"] = f"① 医療機関ベース（ハフ競合按分）  {r['label']}  {r['name']}"
+    ws["A1"].font = Font(bold=True, size=12)
+    ws["A2"] = "【黄色=編集可。取り分率・獲得は自動再計算。『競合の重み合計』はアプリ計算値（λ変更は自店側のみ反映）】"
+    ws["A2"].font = Font(italic=True, size=9, color="B45309")
+    for k, (lab, val) in enumerate([("距離減衰λ(m)", hp.lambda_m), ("門前ブースト", hp.monzen_boost),
+                                    ("候補店の引力", hp.candidate_attractiveness)]):
+        ws.cell(row=4 + k, column=1, value=lab)
+        ws.cell(row=4 + k, column=2, value=val)
+    heads = ["クリニック名", "距離(m)", "年間院外処方(原資)", "自店の重み", "競合の重み合計",
+             "取り分率", "獲得(枚/年)", "診療科", "発行率"]
+    for j, htxt in enumerate(heads, start=1):
+        c = ws.cell(row=9, column=j, value=htxt)
+        c.font = _HDR
+        c.fill = _HDR_FILL2
+    rr = 10
+    for row in r["huff_rows"]:
+        ws.cell(row=rr, column=1, value=row["clinic"])
+        ws.cell(row=rr, column=2, value=round(row["dist"]))
+        ws.cell(row=rr, column=3, value=round(row["pool"])).fill = _INP_FILL
+        ws.cell(row=rr, column=4, value=round(row["self_w"], 4)).fill = _INP_FILL
+        ws.cell(row=rr, column=5, value=round(row["comp_w"], 4)).fill = _INP_FILL
+        ws.cell(row=rr, column=6, value=f"=IF((D{rr}+E{rr})>0,D{rr}/(D{rr}+E{rr}),0)").fill = _CALC_FILL
+        ws.cell(row=rr, column=7, value=f"=C{rr}*F{rr}").fill = _CALC_FILL
+        ws.cell(row=rr, column=8, value=row.get("dept", "その他"))
+        ws.cell(row=rr, column=9, value=round(row.get("issue", 0.0), 3))
+        rr += 1
+    ws.cell(row=rr, column=6, value="合計（＝①予測）").font = _BOLD
+    # クリニックが1件も無い候補地では SUM(G10:G9) が循環参照になるため 0 を直接入れる
+    tot = ws.cell(row=rr, column=7, value=(f"=SUM(G10:G{rr-1})" if r["huff_rows"] else 0))
+    tot.font = _BOLD
+    ws["A7"] = "ハフ按分による予測（年間・枚）"
+    ws["B7"] = f"=G{rr}"
+    ws["B7"].font = _BOLD
+    ws["C7"] = "（月間）"
+    ws["D7"] = f"=B7/12"
+    for col, w in zip("ABCDEFGHI", [28, 10, 18, 12, 14, 10, 14, 12, 9]):
+        ws.column_dimensions[col].width = w
+
+
+def _build_summary_sheet(ws, results):
+    """お客様提示用のサマリー（比較表）。"""
+    ink = "16211E"
+    teal = "0F766E"
+    thin = Side(style="thin", color="D7DEDB")
+    med_thin = Side(style="thin", color="B9C4C0")
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    ncols = 8
+    last_col = get_column_letter(ncols)
+    # タイトル帯
+    ws.merge_cells(f"A1:{last_col}1")
+    t = ws["A1"]
+    t.value = "処方箋獲得予測  ─  出店候補地の比較（社内用・機密）"
+    t.font = Font(bold=True, size=18, color=teal)
+    t.alignment = left
+    ws.row_dimensions[1].height = 30
+    ws.merge_cells(f"A2:{last_col}2")
+    s = ws["A2"]
+    s.value = "① 医療機関ベース（ハフ競合按分）  と  ② 集客ベース（来店客数）  の2つの独立した推計で比較"
+    s.font = Font(size=10, color="5B6662")
+    s.alignment = left
+    ws.row_dimensions[2].height = 18
+
+    # 2段ヘッダー（グループ見出し＋小見出し）
+    hrow1, hrow2 = 4, 5
+    groups = [("", 1), ("", 1), ("", 1), ("① 医療機関ベース", 2), ("② 集客ベース", 2), ("", 1)]
+    col = 1
+    for title, span in groups:
+        if title and span > 1:
+            ws.merge_cells(start_row=hrow1, start_column=col, end_row=hrow1, end_column=col + span - 1)
+            cc = ws.cell(row=hrow1, column=col, value=title)
+            cc.font = Font(bold=True, color="FFFFFF", size=10)
+            cc.fill = PatternFill("solid", fgColor=teal)
+            cc.alignment = center
+            for k in range(span):
+                ws.cell(row=hrow1, column=col + k).fill = PatternFill("solid", fgColor=teal)
+        col += span
+    subheads = ["ラベル", "店舗名 / メモ", "住所", "年間(枚)", "月間(枚)", "年間(枚)", "月間(枚)", "予測レンジ(年)"]
+    for j, htxt in enumerate(subheads, start=1):
+        cc = ws.cell(row=hrow2, column=j, value=htxt)
+        cc.font = Font(bold=True, color="FFFFFF", size=10)
+        cc.fill = PatternFill("solid", fgColor="16897E")
+        cc.alignment = center
+        cc.border = Border(left=thin, right=thin, top=thin, bottom=med_thin)
+
+    # 勝者（集客 or 医療機関が最大）をハイライト
+    def keyval(r):
+        return r["foot_total"] if r["foot_total"] is not None else (r["med_total"] or 0)
+    best_label = max(results, key=keyval)["label"] if results else None
+
+    r0 = hrow2 + 1
+    for i, r in enumerate(results):
+        row = r0 + i
+        ff = f"集客_{r['_suf']}"
+        md = f"医療機関_{r['_suf']}"
+        vals = {
+            1: r["label"], 2: r["name"], 3: r["addr"],
+            4: f"='{md}'!B7", 5: f"='{md}'!D7",
+        }
+        if r["foot_total"] is not None:
+            vals[6] = f"='{ff}'!B18"
+            vals[7] = f"='{ff}'!B19"
+        vals[8] = (f'=IF(AND(ISNUMBER(D{row}),ISNUMBER(F{row})),'
+                   f'TEXT(MIN(D{row},F{row}),"#,##0")&"〜"&TEXT(MAX(D{row},F{row}),"#,##0"),"—")')
+        is_best = (r["label"] == best_label)
+        base_fill = PatternFill("solid", fgColor="E8F3F1") if is_best else (
+            PatternFill("solid", fgColor="F6F8F7") if i % 2 else None)
+        for j in range(1, ncols + 1):
+            cell = ws.cell(row=row, column=j, value=vals.get(j))
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            if base_fill:
+                cell.fill = base_fill
+            if j == 1:
+                cell.font = Font(bold=True, size=11, color=teal)
+                cell.alignment = center
+            elif j in (4, 5, 6, 7):
+                cell.number_format = "#,##0"
+                cell.alignment = right
+                cell.font = Font(size=11, color=ink)
+            elif j == 8:
+                cell.alignment = center
+            else:
+                cell.alignment = left
+        ws.row_dimensions[row].height = 22
+
+    note = r0 + len(results) + 1
+    ws.merge_cells(start_row=note, start_column=1, end_row=note, end_column=ncols)
+    n = ws.cell(row=note, column=1,
+                value="※ ①と②は同じ枚数を別データから見積もった2つの推計です（足し算しません）。"
+                      "詳細な内訳は各「集客_」「医療機関_」シートを参照。")
+    n.font = Font(italic=True, size=9, color="7A8481")
+    ws.merge_cells(start_row=note + 1, start_column=1, end_row=note + 1, end_column=ncols)
+    ws.cell(row=note + 1, column=1,
+            value="※ 緑の行は①②の予測が最大の候補地。").font = Font(italic=True, size=9, color="7A8481")
+    ws.merge_cells(start_row=note + 2, start_column=1, end_row=note + 2, end_column=ncols)
+    ws.cell(row=note + 2, column=1,
+            value="🔴 このシート以降（集客_/医療機関_/RAW_）には院外処方率・発行率・利用率・λ等の"
+                  "自社アサンプションが含まれます。お客様には「お客様提示用」のみを"
+                  "別ファイルでお渡しください。").font = Font(bold=True, size=9, color="B91C1C")
+
+    for col, w in zip("ABCDEFGH", [8, 24, 34, 13, 12, 13, 12, 18]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A6"
+    ws.sheet_view.showGridLines = False
+
+
+
+# ════════════ v1.3: RAWデータシート（1日外来患者数・出典・要確認フラグを含む） ════════════
+_ALERT_FONT = Font(color="B91C1C", bold=True)      # 🔴 要確認 → 赤字
+_ALERT_FILL = PatternFill("solid", fgColor="FDE8E8")
+_WARN_FILL  = PatternFill("solid", fgColor="FFF4E5")
+
+
+def _write_header(ws, heads, row=1, fill=None, freeze=True):
+    for j, h in enumerate(heads, start=1):
+        c = ws.cell(row=row, column=j, value=h)
+        c.font = _HDR
+        c.fill = fill or _HDR_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    if freeze:
+        ws.freeze_panes = ws.cell(row=row + 1, column=1)
+
+
+def _build_raw_med_sheet(wb, results):
+    """医療機関の生データ（候補地ごと）。外来患者数・その出典・要確認フラグを必ず出す。"""
+    ws = wb.create_sheet("RAW_医療機関")
+    heads = ["候補地", "医療機関名", "距離(m)", "緯度", "経度",
+             "1日外来患者数", "外来データ出典", "🔴要確認フラグ",
+             "診療科", "発行率", "院外区分", "施設区分", "病床数", "週診療日数",
+             "診療日", "診療時間", "標榜診療科", "年間院外処方(原資)", "取り分率", "獲得(枚/年)",
+             "データ元", "ナビィ詳細URL"]
+    _write_header(ws, heads)
+    r_i = 2
+    for r in results:
+        hb = {row.get("key"): row for row in r["huff_rows"]}
+        for f in r["med"]:
+            key = facility_key(f)
+            fl = r["flags"].get(key, "")
+            lv = clinic_flag_level(f, r["thr_hi"], r["thr_lo"])
+            days, hours = parse_open_schedule(getattr(f, "raw_fields", None))
+            h = hb.get(key)
+            vals = [
+                r["label"], f.name,
+                round(f.distance_m) if f.distance_m is not None else None,
+                round(f.lat, 6) if f.lat is not None else None,
+                round(f.lon, 6) if f.lon is not None else None,
+                ("不明" if f.daily_outpatients is None else int(f.daily_outpatients)),
+                getattr(f, "daily_outpatients_source", "—"),
+                fl,
+                getattr(f, "dept_name", ""), round(getattr(f, "issue_eff", 0.0) or 0.0, 3),
+                getattr(f, "rx_cat", "") or rx_category(f),
+                getattr(f, "facility_category", ""), f.beds, f.weekly_op_days,
+                days, hours, (getattr(f, "specialties", "") or "")[:120],
+                (round(h["pool"]) if h else 0),
+                (round(h["share"], 4) if h else 0),
+                (round(h["captured"]) if h else 0),
+                f.source, f.detail_url,
+            ]
+            for j, v in enumerate(vals, start=1):
+                cell = ws.cell(row=r_i, column=j, value=v)
+                if lv == "alert":
+                    cell.font = _ALERT_FONT
+                    cell.fill = _ALERT_FILL
+                elif lv == "warn":
+                    cell.fill = _WARN_FILL
+            r_i += 1
+    for col, w in zip("ABCDEFGHIJKLMNOPQRSTUV",
+                      [8, 30, 9, 11, 11, 13, 26, 42, 12, 8, 13, 11, 8, 10, 12, 14, 26, 16, 9, 12, 14, 46]):
+        ws.column_dimensions[col].width = w
+    ws.auto_filter.ref = f"A1:V{max(r_i - 1, 1)}"
+    return ws
+
+
+def _build_raw_ph_sheet(wb, results):
+    """薬局の生データ（候補地ごと）。年間処方箋枚数と出典・面/門前を出す。"""
+    ws = wb.create_sheet("RAW_薬局")
+    heads = ["候補地", "薬局名", "距離(m)", "緯度", "経度", "年間処方箋枚数", "実績の出典",
+             "面/門前", "最寄りクリニック(m)", "開局日", "開局時間", "住所", "データ元", "ナビィ詳細URL",
+             "名簿照合（v2.1）"]
+    _write_header(ws, heads, fill=_HDR_FILL2)
+    r_i = 2
+    for r in results:
+        clmap = {cl["key"]: cl for cl in r["classified"]}
+        for p in r["ph"]:
+            key = pharmacy_key(p)
+            cl = clmap.get(key)
+            is_men = r["override"].get(key, cl["auto_menkata"]) if cl else None
+            days, hours = parse_open_schedule(getattr(p, "raw_fields", None))
+            nearest = (round(cl["nearest_clinic"]) if cl and cl["nearest_clinic"] < 1e8 else None)
+            vals = [
+                r["label"], p.name,
+                round(p.distance_m) if p.distance_m is not None else None,
+                round(p.lat, 6) if p.lat is not None else None,
+                round(p.lon, 6) if p.lon is not None else None,
+                ("不明" if p.annual_rx_count is None else int(p.annual_rx_count)),
+                getattr(p, "annual_rx_source", "—"),
+                ("—" if is_men is None else ("面" if is_men else "門前")),
+                nearest, days, hours, p.address, p.source, p.detail_url,
+                getattr(p, "review_note", "") or "",
+            ]
+            for j, v in enumerate(vals, start=1):
+                cell = ws.cell(row=r_i, column=j, value=v)
+                if v == "不明" and j == 6:
+                    cell.font = Font(color="B45309")
+            r_i += 1
+    for col, w in zip("ABCDEFGHIJKLMNO",
+                      [8, 30, 9, 11, 11, 14, 24, 9, 17, 12, 14, 34, 14, 46, 40]):
+        ws.column_dimensions[col].width = w
+    ws.auto_filter.ref = f"A1:O{max(r_i - 1, 1)}"
+    return ws
+
+
+# ════════════ v1.3: お客様提示用シート（機密アサンプションを一切含まない） ════════════
+# 含めないもの: 院外処方率・処方箋発行率・利用率・受診回数・距離減衰λ・門前ブースト・
+#              候補店の引力・周知率・面競合の重み計算・原資/取り分率などの内部指標。
+# 含めるもの: 候補地ごとの予測枚数（年/月）とレンジ、周辺の医療機関・薬局の公開情報。
+def _build_client_sheet(ws, results):
+    teal, ink = "0F766E", "16211E"
+    thin = Side(style="thin", color="D7DEDB")
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    ncols = 8
+    last_col = get_column_letter(ncols)
+
+    ws.merge_cells(f"A1:{last_col}1")
+    t = ws["A1"]
+    t.value = "処方箋獲得枚数の予測  ─  出店候補地の比較"
+    t.font = Font(bold=True, size=18, color=teal)
+    t.alignment = left
+    ws.row_dimensions[1].height = 30
+    ws.merge_cells(f"A2:{last_col}2")
+    ws["A2"].value = ("2つの独立した方法（周辺医療機関からの推計／店舗の集客からの推計）で"
+                      "同じ枚数を見積もり、その幅をレンジとして示しています。")
+    ws["A2"].font = Font(size=10, color="5B6662")
+    ws["A2"].alignment = left
+
+    hrow = 4
+    heads = ["候補地", "店舗名 / メモ", "住所",
+             "予測枚数（年間）", "予測枚数（月間）", "予測レンジ（年間）",
+             "周辺の医療機関数", "周辺の薬局数"]
+    for j, h in enumerate(heads, start=1):
+        c = ws.cell(row=hrow, column=j, value=h)
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor=teal)
+        c.alignment = center
+        c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for i, r in enumerate(results):
+        row = hrow + 1 + i
+        vals = [v for v in (r["med_total"], r["foot_total"]) if v is not None]
+        mid = (sum(vals) / len(vals)) if vals else 0
+        rng = (f"{min(vals):,.0f} 〜 {max(vals):,.0f}" if len(vals) == 2
+               else (f"{vals[0]:,.0f}" if vals else "—"))
+        n_med = sum(1 for f in r["med"] if getattr(f, "in_area", True))
+        cells = [r["label"], r["name"], r["addr"],
+                 round(mid), round(mid / 12), rng, n_med, len(r["ph"])]
+        for j, v in enumerate(cells, start=1):
+            cell = ws.cell(row=row, column=j, value=v)
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            if i % 2:
+                cell.fill = PatternFill("solid", fgColor="F6F8F7")
+            if j == 1:
+                cell.font = Font(bold=True, size=11, color=teal)
+                cell.alignment = center
+            elif j in (4, 5, 7, 8):
+                cell.number_format = "#,##0"
+                cell.alignment = right
+                cell.font = Font(size=11, color=ink)
+            elif j == 6:
+                cell.alignment = center
+            else:
+                cell.alignment = left
+        ws.row_dimensions[row].height = 22
+
+    note = hrow + len(results) + 2
+    for k, txt in enumerate([
+        "※ 予測枚数は2通りの推計の中間値、レンジは2通りの推計の下限〜上限です。",
+        "※ 周辺の医療機関・薬局は、厚生労働省「医療情報ネット（ナビィ）」とそのオープンデータ、"
+        "地方厚生局「保険医療機関・保険薬局の指定一覧」、およびOpenStreetMapの公開情報に基づきます。",
+        "※ 外来患者数が公開されていない医療機関は「不明」と表示しています（各候補地の「周辺環境」シート参照）。",
+    ]):
+        ws.merge_cells(start_row=note + k, start_column=1, end_row=note + k, end_column=ncols)
+        ws.cell(row=note + k, column=1, value=txt).font = Font(italic=True, size=9, color="7A8481")
+
+    for col, w in zip("ABCDEFGH", [8, 26, 34, 17, 17, 20, 16, 14]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = f"A{hrow + 1}"
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+def _build_client_area_sheet(wb, r):
+    """お客様提示用：候補地まわりの医療機関・薬局の一覧（公開情報のみ）。"""
+    ws = wb.create_sheet(f"周辺環境_{r['_suf']}")
+    teal = "0F766E"
+    ws["A1"] = f"候補地 {r['label']}  {r['name']}  周辺の医療機関・薬局"
+    ws["A1"].font = Font(bold=True, size=13, color=teal)
+    ws["A2"] = r["addr"]
+    ws["A2"].font = Font(size=10, color="5B6662")
+
+    _write_header(ws, ["医療機関名", "距離(m)", "診療科", "1日外来患者数", "院外処方", "診療日", "診療時間"],
+                  row=4)
+    i = 5
+    for f in sorted(r["med"], key=lambda x: (x.distance_m if x.distance_m is not None else 9e9)):
+        days, hours = parse_open_schedule(getattr(f, "raw_fields", None))
+        op = "不明" if f.daily_outpatients is None else int(f.daily_outpatients)
+        for j, v in enumerate([f.name,
+                               round(f.distance_m) if f.distance_m is not None else None,
+                               getattr(f, "dept_name", ""), op,
+                               getattr(f, "rx_cat", "") or rx_category(f), days, hours], start=1):
+            c = ws.cell(row=i, column=j, value=v)
+            if j == 4 and v == "不明":
+                c.font = Font(color="7A8481", italic=True)
+        i += 1
+
+    i += 2
+    ws.cell(row=i, column=1, value="周辺の薬局").font = Font(bold=True, size=12, color="B45309")
+    i += 1
+    _write_header(ws, ["薬局名", "距離(m)", "年間処方箋枚数", "開局日", "開局時間"],
+                  row=i, fill=_HDR_FILL2, freeze=False)
+    i += 1
+    for p in sorted(r["ph"], key=lambda x: (x.distance_m if x.distance_m is not None else 9e9)):
+        days, hours = parse_open_schedule(getattr(p, "raw_fields", None))
+        rx = "不明" if p.annual_rx_count is None else int(p.annual_rx_count)
+        for j, v in enumerate([p.name,
+                               round(p.distance_m) if p.distance_m is not None else None,
+                               rx, days, hours], start=1):
+            c = ws.cell(row=i, column=j, value=v)
+            if j == 3 and v == "不明":
+                c.font = Font(color="7A8481", italic=True)
+        i += 1
+
+    for col, w in zip("ABCDEFG", [32, 10, 14, 15, 14, 14, 16]):
+        ws.column_dimensions[col].width = w
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+def build_excel(results):
+    """社内用ブック。お客様提示用シートも1枚目に含むが、②以降に機密の内訳が入る。"""
+    wb = Workbook()
+    _assign_sheet_suffixes(results)   # 一意なシート名を各候補地に付与（参照ずれ防止）
+    ws_client = wb.active
+    ws_client.title = "お客様提示用"
+    _build_client_sheet(ws_client, results)
+    _build_summary_sheet(wb.create_sheet("比較サマリー"), results)
+    for r in results:
+        _build_footfall_sheet(wb, r)
+        _build_medical_sheet(wb, r)
+    _build_raw_med_sheet(wb, results)
+    _build_raw_ph_sheet(wb, results)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_excel_client(results):
+    """お客様提示用だけの別ブック（機密のアサンプション・内訳シートを一切含まない）。"""
+    wb = Workbook()
+    _assign_sheet_suffixes(results)
+    ws = wb.active
+    ws.title = "お客様提示用"
+    _build_client_sheet(ws, results)
+    for r in results:
+        _build_client_area_sheet(wb, r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ════════════════════════════════ メイン ════════════════════════════════
+st.title("🏪 薬局 出店候補地 分析ツール")
+
+st.markdown("#### 1. 候補地を入力")
+st.caption("候補地ごとに ラベル・店舗名/メモ・住所・月間ユニーク客数（集客ベース用）を入力してください。行は追加できます。")
+
+if "cand_df" not in st.session_state:
+    st.session_state["cand_df"] = pd.DataFrame([
+        {"ラベル": "A", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
+        {"ラベル": "B", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
+        {"ラベル": "C", "店舗名/メモ": "", "住所": "", "月間ユニーク客数": 0, "周知率": 1.0},
+    ])
+
+cand_edited = st.data_editor(
+    st.session_state["cand_df"], num_rows="dynamic", use_container_width=True, key="cand_editor",
+    column_config={
+        "ラベル": st.column_config.TextColumn("ラベル", width="small"),
+        "店舗名/メモ": st.column_config.TextColumn("店舗名/メモ"),
+        "住所": st.column_config.TextColumn("住所", width="large"),
+        "月間ユニーク客数": st.column_config.NumberColumn("月間ユニーク客数", min_value=0, step=500),
+        "周知率": st.column_config.NumberColumn(
+            "周知率", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
+            help="館の来店客のうち、その薬局に接触・到達する割合。"
+                 "食品スーパー=1.0／大型モール1階・主動線沿い=0.3／上層階・動線外=0.1。後から候補地ごとに変更可。",
+        ),
+    },
+)
+st.caption("💡 **周知率**：食品スーパー=**1.0**（既定）／大型モール1階・主動線=**0.3**／上層階・動線外=**0.1**。"
+           "館の来店客数が大きくても、薬局に接触する割合を掛けて過大予測を防ぎます。")
+
+col_run, col_clear = st.columns([3, 1])
+run = col_run.button("▶ 未分析の候補地を分析（続きから）", type="primary", use_container_width=True)
+if col_clear.button("🗑 結果をクリア", use_container_width=True):
+    for k in ("mk_multi", "exp_multi", "med_edit", "ph_edit"):
+        st.session_state[k] = {}
+    st.session_state["multi_raw"] = []
+    st.rerun()
+st.caption("※ 分析は**1店ずつ順に処理**します。もう一度押せば**未分析の店だけ続きから**処理します。"
+           "v1.3で並列取得＋キャッシュに対応したため、3店まとめての分析でも現実的な時間で終わります。")
+
+if run:
+    scraper = get_scraper()
+    assumptions = PredictionAssumptions()
+    targets = [row for _, row in cand_edited.iterrows() if str(row.get("住所", "")).strip()]
+    if not targets:
+        st.warning("住所を1件以上入力してください。")
+        st.stop()
+    existing = st.session_state.setdefault("multi_raw", [])
+    done_labels = {r["label"] for r in existing}
+    todo = []
+    batch_labels = set(done_labels)   # 同一バッチ内のラベル重複も一意化（重複＝候補地が選べなくなる/Excel参照ずれ）
+    for i, row in enumerate(targets):
+        label = str(row.get("ラベル") or f"#{i+1}").strip() or f"#{i+1}"
+        if label in batch_labels:
+            base, k = label, 2
+            while label in batch_labels:
+                label = f"{base}_{k}"
+                k += 1
+            st.warning(f"ラベル『{base}』が重複していたため、この候補地は『{label}』として分析します。")
+        batch_labels.add(label)
+        if label not in done_labels:
+            todo.append((label, row))
+    if not todo:
+        st.info("入力中の候補地はすべて分析済みです。やり直すには『🗑 結果をクリア』を押してください。")
+    else:
+        st.info(f"未分析 {len(todo)}件を順に分析します（1件あたり目安1〜2分）。")
         od_df, od_msg = None, "公式オープンデータはOFF"
         if use_od:
-            bar.progress(1, text="公式オープンデータを準備中…（初回のみ1〜2分）")
-            od_df, od_msg = od_ensure()
-        log.append(f"[データ源] {od_msg}")
-        xc: dict = {}
-        med, ph, clat, clon = run_analysis(
-            address_input.strip(), int(radius_m_max), int(pharmacy_gate_m),
-            (300 if search_pharmacies else 0), log, _Prog(bar),
-            workers=FETCH_WORKERS_DEFAULT, verify_pass=False, use_osm=bool(use_osm),
-            od_df=od_df, use_kouseikyoku=bool(use_kb), xcheck_out=xc, fetch_med_detail=True,
-            detail_max_m=float(radius_m_max) + 100,   # 表示範囲の外の詳細は取らない
-        )
-        # 表示はゾーンの最大距離まで（ナビィの検索範囲はそれより広いことがあるため）
-        results = [f for f in med if f.distance_m is None or f.distance_m <= radius_m_max]
-        pharmacies = ph if search_pharmacies else []
-        # v4.1: 外来患者数が不明な施設の参考値（周辺施設の実データ＋厚生局名簿の医師数から推計）
-        refs = compute_reference_outpatients(med, REF_PT_WEIGHT_DEFAULT)
-        for f in results:
-            f.ref_op, f.ref_op_basis = refs.get(facility_key(f), (None, ""))
-        if pharmacies:
-            assign_monzen_to_clinics(results, pharmacies, float(pharmacy_gate_m))
-        else:
-            for f in results:
-                f.monzen_pharmacy_name, f.monzen_pharmacy_dist_m = "—", None
-                f.monzen_rx_count, f.monzen_rx_source = None, ""
-        st.session_state.results = results
-        st.session_state.pharmacies = pharmacies
-        st.session_state.center_lat = clat
-        st.session_state.center_lon = clon
-        st.session_state.search_log = log
-        st.session_state.last_address = address_input.strip()
-        st.session_state.last_zones = zones
-        st.session_state.last_gate = int(pharmacy_gate_m)
-        st.session_state.xcheck = xc
-        st.session_state.od_msg = od_msg
-        st.session_state.searched_ph = bool(search_pharmacies)
-        bar.progress(100, text="✅ 完了!")
-        time.sleep(0.3)
-        bar.empty()
-    except Exception as e:
-        bar.empty()
-        if e.__class__.__name__ in ("StopException", "RerunException"):
-            raise
-        st.error(f"検索中にエラーが発生しました: {type(e).__name__}: {e}")
-        with st.expander("🔧 エラー詳細（開発者に伝える用）", expanded=True):
-            st.code(traceback.format_exc())
-        if log:
-            with st.expander("📋 実行ログ（どこまで進んだか）", expanded=True):
-                st.text("\n".join(log))
+            _odn = st.empty()
+            with st.spinner("公式オープンデータを準備中…（初回のみ1〜2分）"):
+                od_df, od_msg = od_ensure(note=lambda t: _odn.caption(t))
+            _odn.empty()
+            (st.caption if od_df is not None else st.warning)(f"🗂 {od_msg}")
+        overall = st.progress(0.0, text="開始…")
+        for i, (label, row) in enumerate(todo):
+            addr = str(row["住所"]).strip()
+            uni = float(_num(row.get("月間ユニーク客数")) or 0)   # 空欄(NaN)は0に
+            overall.progress(i / len(todo), text=f"[{label}] {addr} を分析中… ({i+1}/{len(todo)})")
+            log = [f"[データ源] {od_msg}"]
+            xc: dict = {}
+            prog = st.progress(0.0, text=f"[{label}] 収集中…")
+            try:
+                med, ph, clat, clon = run_analysis(
+                    addr, int(radius_m), gate_m, int(max_detail), log, prog,
+                    assumptions=assumptions, polygons=[], exclude_outside_med=True,
+                    workers=int(fetch_workers), verify_pass=bool(verify_pass),
+                    use_osm=bool(use_osm),
+                    od_df=od_df, use_kouseikyoku=bool(use_kb), xcheck_out=xc,
+                )
+                prog.empty()
+            except Exception as e:
+                prog.empty()
+                st.error(f"[{label}] 分析に失敗: {e}")
+                continue
+            if clat is None:
+                st.error(f"[{label}] 住所の座標が取得できませんでした：{addr}")
+                continue
+            exposure = _num(row.get("周知率"))   # 空欄(NaN)は既定1.0
+            exposure = float(exposure) if exposure is not None else 1.0
+            # ★完了と同時に保存（中断されても、ここまで完了した店は残る）
+            st.session_state["multi_raw"].append({
+                "label": label, "name": str(row.get("店舗名/メモ") or ""),
+                "addr": addr, "uni": uni, "exposure": exposure,
+                "clat": clat, "clon": clon, "med": med, "ph": ph,
+                "log": list(log),    # v1.4: 取りこぼし診断・処理ログ用に保持
+                "xcheck": xc, "od_msg": od_msg})   # v2.1: 厚生局名簿との突き合わせ結果
+        overall.progress(1.0, text="完了")
+        overall.empty()
+        st.rerun()
 
-# ── 結果表示 ──────────────────────────────────────────────────────────────────
-if st.session_state.results:
-    results: List[MedFacility] = st.session_state.results
-    pharmacies: List[PharmacyFacility] = st.session_state.get("pharmacies", [])
-    center_lat = st.session_state.center_lat
-    center_lon = st.session_state.center_lon
-    zones_saved = st.session_state.last_zones
-    gate_saved = st.session_state.last_gate
 
-    _ZONE_ICONS = ["🔵", "🟢", "🟡", "🔴", "🟣"]
-    zone_labels = [f"〜{z:,}m" for z in zones_saved]
-    zone_colors = _ZONE_ICONS[:len(zones_saved)]
-    st.success(
-        f"**{st.session_state.last_address}** 周辺 "
-        + " ／ ".join(f"{c}〜{z:,}m" for c, z in zip(zone_colors, zones_saved))
-        + f" 圏内: **{len(results)} 件** が見つかりました"
-    )
-    n_review = sum(1 for f in results if f.review_note)
-    n_unknown = sum(1 for f in results if f.daily_outpatients is None)
-    n_ref = sum(1 for f in results if f.daily_outpatients is None and f.ref_op)
-    if n_unknown:
-        st.info(f"外来患者数がナビィに無い施設：**{n_unknown}件**（うち参考値あり {n_ref}件）。"
-                "参考値＝常勤換算の医師数（厚生局名簿）×同じ診療科の『医師1人あたり外来数』の中央値"
-                "（周辺施設の実データ）。実数ではないので扱いにご注意ください。")
-    if n_review:
-        st.warning(f"🟠 **{n_review}件** は公式名簿との照合で要確認です（一覧の『確認』列・ログタブの取りこぼし診断）。")
+# ── 結果の比較表示（毎回、現在の設定＋手修正で再計算） ──────────────────────────
+# ── 編集表は st.form で包む：セル編集中はサーバーに送信せず、「反映して再計算」押下時に
+#  全編集を一括送信・確定する。（v1.2修正）以前は st.fragment 隔離だったが、
+#  セル確定のたびに再実行が走り、連続入力中の値が巻き戻って消える／編集中に「反映」を
+#  押すと1回目のクリックがセル確定に吸われて再計算されない事象があった。form化で
+#  編集中の再実行が起きなくなり、追加・修正が確実に反映される。
+#  （反映時は session_state へ保存→ウィジェット状態をクリア→全体再計算。従来どおり）
 
-    z_cols = st.columns(len(zones_saved))
-    for label, color, col in zip(zone_labels, zone_colors, z_cols):
-        z_facs = [f for f in results if get_zone_label(f.distance_m, zones_saved) == label]
-        op_vals = [f.daily_outpatients for f in z_facs if f.daily_outpatients]
-        col.metric(f"{color} {label}", f"{len(z_facs)}件",
-                   delta=f"外来合計 {sum(op_vals):,}人/日" if op_vals else "外来データなし",
-                   delta_color="off")
+def _row_flag(r, fmap, high_thr, low_thr):
+    """表示行の『検証』文字列。基データにあればそのフラグ、手動追加行は外来数から判定。"""
+    f = fmap.get(r.get("_key"))
+    if f is not None:
+        return f
+    op = _num(r.get("op"))
+    if op is None:
+        return "🔴 外来不明"
+    if op <= low_thr:
+        return f"🔴 外来{int(op)}人/日（{int(low_thr)}人以下・過小/未報告の疑い）"
+    if op >= high_thr:
+        return f"🔴 外来{int(op)}人/日（{int(high_thr)}人以上・月間/年間値の混入疑い）"
+    return ""
 
-    tab_table, tab_pharmacy, tab_map, tab_debug, tab_log = st.tabs(
-        ["📋 医療機関一覧", f"💊 近隣薬局({len(pharmacies)}件)", "🗺️ 地図", "🔬 デバッグ",
-         "📝 ログ・取りこぼし診断"])
 
-    with tab_table:
-        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-        zone_filter = col_f1.selectbox("🔵 ゾーン", ["すべて"] + zone_labels)
-        rx_filter = col_f2.selectbox("処方タイプ", ["すべて", "院外処方あり", "院内処方のみ", "不明"])
-        cat_filter = col_f3.selectbox("施設種別", ["すべて", "診療所", "病院"])
-        sort_col = col_f4.selectbox("並び順", ["距離（近い順）", "施設名", "外来患者数（多い順）"])
+def render_med_editor(sel, c, med_high_thr_v, med_low_thr_v=OP_LOW_THR_DEFAULT):
+    """医療機関の一覧＝確認と修正を同じ表で行うメインUI（v1.3で画面の主役に変更）。
 
-        filtered = list(results)
-        if zone_filter != "すべて":
-            filtered = [f for f in filtered if get_zone_label(f.distance_m, zones_saved) == zone_filter]
-        if rx_filter != "すべて":
-            filtered = [f for f in filtered if f.rx_summary == rx_filter]
-        if cat_filter != "すべて":
-            filtered = [f for f in filtered if f.facility_category == cat_filter]
-        if sort_col == "施設名":
-            filtered.sort(key=lambda x: x.name)
-        elif sort_col == "外来患者数（多い順）":
-            filtered.sort(key=lambda x: x.daily_outpatients or 0, reverse=True)
-        else:
-            filtered.sort(key=lambda x: x.distance_m or 9_999_999)
+    使い方の想定：『検証』列の🔴を見て怪しい施設を見つけ、その場で外来(人/日)や診療科を
+    正しい値に打ち直し、「反映して再計算」で①の予測に反映する。
+    """
+    dr = get_dept_rates()
+    med_edit = st.session_state.setdefault("med_edit", {})
+    recs = med_edit.setdefault(sel, [])
+    fmap = {facility_key(f): clinic_flag(f, med_high_thr_v, med_low_thr_v) for f in c["med"]}
+    sched_map = {facility_key(f): parse_open_schedule(getattr(f, "raw_fields", None))
+                 for f in c["med"]}
 
-        def _monzen_label(fac):
-            nm = getattr(fac, "monzen_pharmacy_name", "—")
-            d = getattr(fac, "monzen_pharmacy_dist_m", None)
-            if nm and nm not in ("なし", "不明（座標なし）", "—"):
-                return f"あり：{nm}（{int(d)}m）"
-            if nm == "なし" and d is not None:
-                return f"なし（最近接 {int(d)}m）"
-            return nm or "なし"
+    st.markdown("##### 🏥 医療機関の確認・修正（① 医療機関ベースの元データ）")
+    rows = []
+    for r in recs:
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        dept = r.get("dept") if r.get("dept") in DEPT_OPTIONS else "その他"
+        rows.append({
+            "検証": _row_flag(r, fmap, med_high_thr_v, med_low_thr_v),
+            "医療機関": r.get("name"),
+            "距離(m)": (round(haversine(c["clat"], c["clon"], lat, lon))
+                       if (lat is not None and lon is not None) else None),
+            "外来(人/日)": r.get("op"),
+            "診療科": dept,
+            "発行率": eff_issue_rate(dept, _num(r.get("issue")), dr),
+            "院外区分": (r.get("cat") if r.get("cat") in _EXT_CATS else "不明"),
+            "診療日": sched_map.get(r.get("_key"), ("", ""))[0],
+            "診療時間": sched_map.get(r.get("_key"), ("", ""))[1],
+            "緯度": lat, "経度": lon,
+            "_key": r.get("_key"),
+        })
 
-        rows = []
-        for fac in filtered:
-            rows.append({
-                "確認": ("🟠 " + fac.review_note) if fac.review_note else "",
-                "ゾーン": get_zone_label(fac.distance_m, zones_saved),
-                "施設名": fac.name,
-                "距離(m)": int(fac.distance_m) if fac.distance_m is not None else None,
-                "種別": fac.facility_category,
-                "診療科": fac.specialties or "—",
-                "院外処方": fac.rx_summary,
-                "院内処方(有無)": fac.inhouse_rx,
-                "院外処方(有無)": fac.outpatient_rx,
-                "1日外来患者数": fac.daily_outpatients,
-                "外来出典": fac.daily_outpatients_source,
-                "外来の参考値": fac.ref_op if fac.daily_outpatients is None else None,
-                "参考値の根拠": fac.ref_op_basis if fac.daily_outpatients is None else "",
-                "週診療日数": fac.weekly_op_days,
-                "常勤医師数": fac.kb_doctors_ft,
-                "門前薬局": _monzen_label(fac),
-                "年間処方箋数": getattr(fac, "monzen_rx_count", None),
-                "処方箋数出典": (getattr(fac, "monzen_rx_source", "")
-                             if getattr(fac, "monzen_rx_count", None) else "—"),
-                "データ元": fac.source,
-                "住所": fac.address,
-            })
-        st.caption(f"表示: {len(rows)}件 / 全{len(results)}件")
-        st.dataframe(
-            pd.DataFrame(rows), use_container_width=True, height=520, hide_index=True,
+    n_alert = sum(1 for x in rows if x["検証"])
+    n_unknown = sum(1 for x in rows if "外来不明" in (x["検証"] or ""))
+    if n_alert:
+        st.error(f"🔴 **{n_alert}件が要確認**（うち外来不明 {n_unknown}件）"
+                 f"— 外来不明／{int(med_low_thr_v)}人以下／{int(med_high_thr_v)}人以上。"
+                 "『検証』列に🔴が付いた行は、ナビィ原本やGoogleマップで確かめて"
+                 "**外来(人/日)・診療科・院外区分を下の表に直接入力し直してください。**")
+    else:
+        st.success("✅ 外来患者数の要確認はありません（不明・過小・過大の該当なし）。")
+    st.caption("この表がそのまま①の計算に使われます。セルを編集 →「🔄 反映して再計算」で"
+               "上の予測・マップに反映されます。行の削除（左端で選択して delete）や"
+               "漏れた施設の追加もできます。")
+
+    if st.checkbox("🔴 要確認の行を上に並べる", value=True, key=f"srt_{sel}"):
+        rows.sort(key=lambda x: (0 if x["検証"] else 1,
+                                 x["距離(m)"] if x["距離(m)"] is not None else 9_999_999))
+
+    disp = pd.DataFrame(rows)
+    # 欠測は "None" ではなく空欄で見せる（外来未入力＝空欄。『検証』列に「🔴 外来不明」が出る）
+    for _c, _t in (("外来(人/日)", "Int64"), ("距離(m)", "Int64"),
+                   ("緯度", "float"), ("経度", "float"), ("発行率", "float")):
+        if _c in disp:
+            disp[_c] = pd.to_numeric(disp[_c], errors="coerce").astype(_t)
+    with st.form(f"medform_{sel}", border=False):
+        ed = st.data_editor(
+            disp, hide_index=True, use_container_width=True, num_rows="dynamic",
+            key=f"med_edit_{sel}", disabled=["検証", "_key", "診療日", "診療時間"],
+            height=min(620, 60 + 35 * max(len(rows), 3)),
             column_config={
-                "確認": st.column_config.TextColumn("確認", width="medium"),
-                "ゾーン": st.column_config.TextColumn("ゾーン", width="small"),
-                "施設名": st.column_config.TextColumn("施設名", width="medium"),
-                "距離(m)": st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
-                "種別": st.column_config.TextColumn("種別", width="small"),
-                "診療科": st.column_config.TextColumn("診療科", width="medium"),
-                "院外処方": st.column_config.TextColumn("処方タイプ", width="medium"),
-                "院内処方(有無)": st.column_config.TextColumn("院内処方", width="small"),
-                "院外処方(有無)": st.column_config.TextColumn("院外処方", width="small"),
-                "1日外来患者数": st.column_config.NumberColumn("1日外来", format="%d 人/日", width="small"),
-                "外来出典": st.column_config.TextColumn("外来出典", width="medium"),
-                "外来の参考値": st.column_config.NumberColumn(
-                    "外来の参考値", format="%d 人/日", width="small",
-                    help="外来患者数がナビィに無い施設の推計値（実数ではありません）。根拠は右隣の列。"),
-                "参考値の根拠": st.column_config.TextColumn("参考値の根拠", width="large"),
-                "週診療日数": st.column_config.NumberColumn("週診療日", format="%.1f 日", width="small"),
-                "常勤医師数": st.column_config.NumberColumn("常勤医師", format="%d 人", width="small",
-                                                         help="厚生局名簿の常勤医師数"),
-                "門前薬局": st.column_config.TextColumn(f"門前薬局（{gate_saved}m以内）", width="large"),
-                "年間処方箋数": st.column_config.NumberColumn("年間処方箋数", format="%d 枚", width="small"),
-                "処方箋数出典": st.column_config.TextColumn("処方箋数出典", width="medium"),
-                "データ元": st.column_config.TextColumn("データ元", width="small"),
-                "住所": st.column_config.TextColumn("住所", width="large"),
+                "検証": st.column_config.TextColumn(
+                    "検証", width="large",
+                    help="🔴＝要確認。外来患者数がナビィ未入力／過小／過大（月間・年間値の混入疑い）。"),
+                "医療機関": st.column_config.TextColumn("医療機関", width="medium"),
+                "外来(人/日)": st.column_config.NumberColumn(
+                    "外来(人/日) ※空欄(None)＝不明", min_value=0, step=1,
+                    help="ナビィの1日平均外来患者数。空欄（Noneと表示）＝ナビィに入力なし＝不明。"
+                         "正しい値を入れると①の予測に即反映されます。"),
+                "診療科": st.column_config.SelectboxColumn(
+                    "診療科", options=DEPT_OPTIONS, width="small",
+                    help="標榜診療科から自動判定。変えると発行率がその科の初期値になります。"),
+                "発行率": st.column_config.NumberColumn(
+                    "発行率", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                    help="この施設だけ発行率を手入力で上書きできます（受診のうち投薬に至る割合）。"),
+                "院外区分": st.column_config.SelectboxColumn("院外区分", options=_EXT_CATS, width="medium"),
+                "距離(m)": st.column_config.NumberColumn(
+                    "距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
+                "診療日": st.column_config.TextColumn("診療日", help="ナビィの診療時間表から抽出（開いている曜日）。"),
+                "診療時間": st.column_config.TextColumn("診療時間", help="ナビィの診療時間表から抽出（代表的な時間帯）。"),
+                "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
+                "経度": st.column_config.NumberColumn("経度", format="%.6f"),
             },
         )
+        apply_med = st.form_submit_button("🔄 反映して再計算", type="primary")
+        st.caption("※ セル入力の直後は1回目のクリックが入力確定に使われることがあります。"
+                   "上の①②の数字が変わらない場合はもう一度押してください。")
 
-        st.divider()
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("総件数", f"{len(results)}件")
-        c2.metric("院外処方あり", f"{sum(1 for f in results if '院外処方あり' in f.rx_summary)}件")
-        c3.metric("詳細取得済", f"{sum(1 for f in results if f.detail_fetched)}件")
-        avg_op = [f.daily_outpatients for f in results if f.daily_outpatients]
-        c4.metric("平均外来患者数", f"{sum(avg_op) / len(avg_op):.0f}人/日" if avg_op else "—")
-        avg_wd = [f.weekly_op_days for f in results if f.weekly_op_days]
-        c5.metric("平均週診療日数", f"{sum(avg_wd) / len(avg_wd):.1f}日" if avg_wd else "—")
+    # ── ➕ 漏れた医療機関を追加（フォーム＝確実に追加。消えない・戻らない） ──
+    with st.expander("➕ 漏れた医療機関を追加（Google Map等で見つけたクリニック）", expanded=False):
+        with st.form(f"addmed_{sel}", clear_on_submit=True):
+            a1, a2, a3 = st.columns([3, 2, 2])
+            nm = a1.text_input("医療機関名", key=f"amnm_{sel}")
+            dist = a2.number_input("候補地からの距離(m)", 0, 6000, 0, 50, key=f"amdist_{sel}")
+            op_in = a3.number_input("外来(人/日)", 0, 3000, 0, 5, key=f"amop_{sel}")
+            b1, b2, b3, b4 = st.columns(4)
+            la = b1.text_input("緯度(任意・最も正確)", key=f"amla_{sel}")
+            lo = b2.text_input("経度(任意)", key=f"amlo_{sel}")
+            dept_in = b3.selectbox("診療科", DEPT_OPTIONS, key=f"amdept_{sel}")
+            cat_in = b4.selectbox("院外区分", _EXT_CATS, key=f"amcat_{sel}")
+            st.caption("距離だけでもOK（候補地の真北に仮置きします）。緯度経度はGoogle Mapで右クリックすると取得できます。")
+            if st.form_submit_button("➕ 追加する", type="primary"):
+                nm = (nm or "").strip()
+                lat, lon = _num(la), _num(lo)
+                if (lat is None or lon is None) and dist > 0:
+                    lat, lon = c["clat"] + dist / 111000.0, c["clon"]
+                if nm and lat is not None and lon is not None:
+                    recs.append({"name": nm, "lat": lat, "lon": lon,
+                                 "op": (int(op_in) if op_in else None),
+                                 "cat": cat_in, "dept": dept_in, "issue": None,
+                                 "_key": f"name:{nm}"})
+                    st.rerun(scope="app")
+                else:
+                    st.warning("医療機関名と、距離または緯度経度を入力してください。")
 
-        st.divider()
-        area_kw = extract_area_keyword(st.session_state.last_address)
-        zone_tag = "_".join(str(z) for z in zones_saved) + "m"
-        csv_rows = [{
-            "ゾーン": get_zone_label(f.distance_m, zones_saved),
-            "施設名": f.name,
-            "住所": f.address,
-            "距離_m": int(f.distance_m) if f.distance_m is not None else "",
-            "施設種別": f.facility_category,
-            "診療科": f.specialties,
-            "処方タイプ": f.rx_summary,
-            "院内処方の有無": f.inhouse_rx,
-            "院外処方の有無": f.outpatient_rx,
-            "1日外来患者数": f.daily_outpatients if f.daily_outpatients is not None else "",
-            "外来患者数出典": f.daily_outpatients_source,
-            "外来の参考値": (f.ref_op or "") if f.daily_outpatients is None else "",
-            "参考値の根拠": f.ref_op_basis if f.daily_outpatients is None else "",
-            "週平均診療日数": f.weekly_op_days or "",
-            "常勤医師数": f.kb_doctors_ft if f.kb_doctors_ft is not None else "",
-            "非常勤医師数": f.kb_doctors_pt if f.kb_doctors_pt is not None else "",
-            "門前薬局": getattr(f, "monzen_pharmacy_name", ""),
-            "門前薬局距離_m": (int(f.monzen_pharmacy_dist_m)
-                          if getattr(f, "monzen_pharmacy_dist_m", None) is not None else ""),
-            "年間処方箋数_門前": getattr(f, "monzen_rx_count", None) or "",
-            "処方箋数出典": (getattr(f, "monzen_rx_source", "")
-                       if getattr(f, "monzen_rx_count", None) else "—"),
-            "名簿照合": f.review_note,
-            "データソース": f.source,
-            "MHLW_URL": f.detail_url,
-        } for f in results]
-        st.download_button(
-            "⬇️ CSV ダウンロード",
-            data=pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"medical_{area_kw}_{zone_tag}.csv", mime="text/csv",
-        )
-
-    with tab_pharmacy:
-        if not pharmacies:
-            st.info("「💊 近隣薬局も検索する」をONにして再検索すると薬局情報が表示されます。")
-        else:
-            ph_monzen = [p for p in pharmacies if p.pharmacy_type == "門前薬局"]
-            ph_men = [p for p in pharmacies if p.pharmacy_type == "面薬局"]
-            pc1, pc2, pc3 = st.columns(3)
-            pc1.metric("薬局 合計", f"{len(pharmacies)}件")
-            pc2.metric("🏥 門前薬局", f"{len(ph_monzen)}件", delta=f"医療機関{gate_saved}m以内",
-                       delta_color="off")
-            pc3.metric("🏪 面薬局", f"{len(ph_men)}件")
-            pf1, pf2 = st.columns(2)
-            ph_type_filter = pf1.selectbox("薬局種別", ["すべて", "門前薬局", "面薬局", "不明"])
-            ph_sort = pf2.selectbox("並び順", ["距離（近い順）", "処方箋数（多い順）", "施設名"])
-            ph_filtered = list(pharmacies)
-            if ph_type_filter != "すべて":
-                ph_filtered = [p for p in ph_filtered if p.pharmacy_type == ph_type_filter]
-            if ph_sort == "処方箋数（多い順）":
-                ph_filtered.sort(key=lambda x: x.annual_rx_count or 0, reverse=True)
-            elif ph_sort == "施設名":
-                ph_filtered.sort(key=lambda x: x.name)
+    if apply_med:
+        new_recs = resolve_edit(ed, "医療機関", "外来(人/日)", "op", recs, c["clat"], c["clon"],
+                                cat_col="院外区分", dept_col="診療科", issue_col="発行率")
+        old_map = {r.get("_key"): r for r in recs if r.get("_key")}
+        for nr in new_recs:
+            disp_iss = nr.pop("issue_disp", None)
+            old = old_map.get(nr.get("_key"))
+            old_dept = (old or {}).get("dept")
+            old_issue = (old or {}).get("issue")
+            old_eff = eff_issue_rate(
+                old_dept if old_dept in dr else (nr.get("dept") or "その他"), old_issue, dr)
+            ndept = nr.get("dept")
+            if ndept is not None and ndept != old_dept:
+                nr["issue"] = None                 # 診療科を変更→その科の初期値に従う
+                nr["dept"] = ndept
+            elif disp_iss is not None and abs(disp_iss - old_eff) > 1e-6:
+                nr["issue"] = disp_iss             # 発行率を手入力→この施設だけ上書き
+                nr["dept"] = old_dept or ndept or "その他"
             else:
-                ph_filtered.sort(key=lambda x: x.distance_m or 9_999_999)
-            ph_rows = [{
-                "確認": ("🟠 " + p.review_note) if p.review_note else "",
-                "薬局種別": p.pharmacy_type,
-                "薬局名": p.name,
-                "距離(m)": int(p.distance_m) if p.distance_m is not None else None,
-                "年間処方箋数": p.annual_rx_count,
-                "処方箋数出典": p.annual_rx_source,
-                "最近接医療機関": p.nearest_clinic_name,
-                "医療機関距離(m)": int(p.nearest_clinic_dist_m) if p.nearest_clinic_dist_m is not None else None,
-                "住所": p.address,
-            } for p in ph_filtered]
-            st.caption(f"表示: {len(ph_rows)}件 / 全{len(pharmacies)}件")
-            st.dataframe(
-                pd.DataFrame(ph_rows), use_container_width=True, height=460, hide_index=True,
+                nr["issue"] = old_issue
+                nr["dept"] = old_dept or ndept or "その他"
+        med_edit[sel] = new_recs
+        st.session_state.pop(f"med_edit_{sel}", None)   # ウィジェット状態をクリア＝追加行の重複増殖を防止
+        st.rerun(scope="app")
+
+
+def render_ph_editor(sel, c):
+    ph_edit = st.session_state.setdefault("ph_edit", {})
+    mk_all = st.session_state.setdefault("mk_multi", {})
+    mk = mk_all.setdefault(sel, {})
+    precs = ph_edit.setdefault(sel, [])
+    with st.expander("🔧 薬局の確認・修正（漏れの追加・座標・実績・面/門前・削除 → ①②に反映）", expanded=False):
+        # ── ➕ 漏れた薬局を追加（フォーム＝確実に追加。面/門前もそのまま保存） ──
+        with st.form(f"addph_{sel}", clear_on_submit=True):
+            st.markdown("**➕ 漏れた薬局を追加**（Google Map等で見つけた店。距離だけでもOK）")
+            a1, a2, a3, a4 = st.columns([3, 2, 2, 2])
+            nm = a1.text_input("薬局名", key=f"apnm_{sel}")
+            dist = a2.number_input("候補地からの距離(m)", 0, 6000, 0, 50, key=f"apdist_{sel}")
+            rx_in = a3.number_input("実績(枚/年・任意)", 0, 200000, 0, 100, key=f"aprx_{sel}")
+            men_in = a4.selectbox("面/門前", ["面", "門前"], key=f"apmen_{sel}",
+                                  help="面＝集客の競合に数える／門前＝競合から外す")
+            b1, b2 = st.columns(2)
+            la = b1.text_input("緯度(任意・最も正確)", key=f"apla_{sel}")
+            lo = b2.text_input("経度(任意)", key=f"aplo_{sel}")
+            if st.form_submit_button("➕ 追加する", type="primary"):
+                nm = (nm or "").strip()
+                lat, lon = _num(la), _num(lo)
+                if (lat is None or lon is None) and dist > 0:
+                    lat, lon = c["clat"] + dist / 111000.0, c["clon"]
+                if nm and lat is not None and lon is not None:
+                    key = f"name:{nm}"
+                    precs.append({"name": nm, "lat": lat, "lon": lon,
+                                  "rx": (int(rx_in) if rx_in else None), "_key": key})
+                    mk[key] = (men_in == "面")   # 面/門前の手動選択を確実に保存（自動判定に戻らない）
+                    st.rerun(scope="app")
+                else:
+                    st.warning("薬局名と、距離または緯度経度を入力してください。")
+        st.caption("下の表で既存薬局の**座標・実績・面/門前の修正や行削除**ができます"
+                   "（修正後は「反映して再計算」を押す）。『最寄りクリニック(m)』が近い店が門前の目安。")
+        clmap = {r["key"]: r for r in c["classified"]}
+        psched_map = {pharmacy_key(p): parse_open_schedule(getattr(p, "raw_fields", None))
+                      for p in c["ph"]}
+        pnote_map = {pharmacy_key(p): (("🟠 " + p.review_note) if getattr(p, "review_note", "") else "")
+                     for p in c["ph"]}
+        pdisp = pd.DataFrame([{
+            "確認": pnote_map.get(r.get("_key"), ""),
+            "薬局": r.get("name"),
+            "距離(m)": (round(haversine(c["clat"], c["clon"], _num(r.get("lat")), _num(r.get("lon"))))
+                       if (_num(r.get("lat")) is not None and _num(r.get("lon")) is not None) else None),
+            "緯度": _num(r.get("lat")), "経度": _num(r.get("lon")),
+            "実績(枚/年)": r.get("rx"),
+            "最寄りクリニック(m)": (round(clmap[r.get("_key")]["nearest_clinic"])
+                                if (r.get("_key") in clmap and clmap[r.get("_key")]["nearest_clinic"] < 1e8) else None),
+            "面/門前": ("面" if mk.get(r.get("_key"),
+                       (clmap[r.get("_key")]["auto_menkata"] if r.get("_key") in clmap else True)) else "門前"),
+            "開局日": psched_map.get(r.get("_key"), ("", ""))[0],
+            "開局時間": psched_map.get(r.get("_key"), ("", ""))[1],
+            "_key": r.get("_key"),
+        } for r in precs])
+        for _c, _t in (("実績(枚/年)", "Int64"), ("距離(m)", "Int64"),
+                       ("最寄りクリニック(m)", "Int64"), ("緯度", "float"), ("経度", "float")):
+            if _c in pdisp:
+                pdisp[_c] = pd.to_numeric(pdisp[_c], errors="coerce").astype(_t)
+        with st.form(f"phform_{sel}", border=False):
+            ped = st.data_editor(
+                pdisp, hide_index=True, use_container_width=True, num_rows="dynamic",
+                key=f"ph_edit_{sel}",
+                disabled=["確認", "最寄りクリニック(m)", "_key", "開局日", "開局時間"],
                 column_config={
-                    "確認": st.column_config.TextColumn("確認", width="medium"),
-                    "薬局種別": st.column_config.TextColumn("種別", width="small"),
-                    "薬局名": st.column_config.TextColumn("薬局名", width="medium"),
-                    "距離(m)": st.column_config.NumberColumn("距離(m)", format="%d m", width="small"),
-                    "年間処方箋数": st.column_config.NumberColumn("年間処方箋数", format="%d 枚", width="small"),
-                    "処方箋数出典": st.column_config.TextColumn("処方箋数出典", width="medium"),
-                    "最近接医療機関": st.column_config.TextColumn("最近接医療機関", width="medium"),
-                    "医療機関距離(m)": st.column_config.NumberColumn("医療機関距離", format="%d m", width="small"),
-                    "住所": st.column_config.TextColumn("住所", width="large"),
+                    "緯度": st.column_config.NumberColumn("緯度", format="%.6f"),
+                    "経度": st.column_config.NumberColumn("経度", format="%.6f"),
+                    "距離(m)": st.column_config.NumberColumn("距離(m)", help="正しい距離を直接入力しても補正できます（向き保持）。最も正確なのは緯度経度。"),
+                    "実績(枚/年)": st.column_config.NumberColumn(
+                        "実績(枚/年) ※空欄(None)＝不明", min_value=0, step=100,
+                        help="ナビィの年間総取扱処方箋数。空欄（Noneと表示）＝ナビィに入力なし＝不明。"),
+                    "面/門前": st.column_config.SelectboxColumn("面/門前", options=["面", "門前"], width="small",
+                                                           help="面＝集客の競合に数える／門前＝競合から外す"),
+                    "開局日": st.column_config.TextColumn("開局日", help="ナビィの開局時間表から抽出（開いている曜日）。"),
+                    "開局時間": st.column_config.TextColumn("開局時間", help="ナビィの開局時間表から抽出（代表的な時間帯）。"),
                 },
             )
-            st.divider()
-            ph_csv_rows = [{
-                "薬局種別": p.pharmacy_type,
-                "薬局名": p.name,
-                "住所": p.address,
-                "距離_m": int(p.distance_m) if p.distance_m is not None else "",
-                "年間総取扱処方箋数": p.annual_rx_count or "",
-                "処方箋数出典": p.annual_rx_source,
-                "最近接医療機関": p.nearest_clinic_name,
-                "医療機関距離_m": int(p.nearest_clinic_dist_m) if p.nearest_clinic_dist_m is not None else "",
-                "名簿照合": p.review_note,
-                "データソース": p.source,
-                "MHLW_URL": p.detail_url,
-            } for p in pharmacies]
-            st.download_button(
-                "⬇️ 薬局リスト CSV ダウンロード",
-                data=pd.DataFrame(ph_csv_rows).to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"pharmacies_{extract_area_keyword(st.session_state.last_address)}.csv",
-                mime="text/csv",
-            )
-
-    with tab_map:
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
-        folium.Marker([center_lat, center_lon], popup=st.session_state.last_address,
-                      tooltip="📍 薬局候補地",
-                      icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
-        _circle_colors = ["#EF4444", "#A855F7", "#EAB308", "#22C55E", "#3B82F6"]
-        _circle_opacity = [0.03, 0.04, 0.05, 0.07, 0.10]
-        for i, z in enumerate(reversed(zones_saved)):
-            idx = len(zones_saved) - 1 - i
-            folium.Circle([center_lat, center_lon], radius=z, color=_circle_colors[idx], fill=True,
-                          fill_opacity=_circle_opacity[idx], weight=2,
-                          tooltip=f"ゾーン{idx + 1} 〜{z:,}m").add_to(m)
-        for fac in results:
-            if fac.lat is None or fac.lon is None:
-                continue
-            zone_lbl = get_zone_label(fac.distance_m, zones_saved)
-            color = ("orange" if fac.review_note
-                     else "green" if fac.rx_summary == "院外処方あり"
-                     else "beige" if fac.rx_summary == "院内処方のみ"
-                     else "purple" if fac.facility_category == "病院"
-                     else "gray")
-            icon_name = "hospital-o" if fac.facility_category == "病院" else "stethoscope"
-            op_txt = (f"<b>{fac.daily_outpatients}</b> 人/日" if fac.daily_outpatients is not None
-                      else (f"不明（参考値 {fac.ref_op} 人/日）" if fac.ref_op else "不明"))
-            popup_html = f"""
-<div style="min-width:230px;font-family:sans-serif;font-size:13px">
-  <b>{fac.name}</b><br>
-  <span style="color:#64748b;font-size:11px">{fac.address or '—'}</span><br>
-  <hr style="margin:4px 0">
-  📏 <b>{(fac.distance_m or 0):,.0f} m</b> ／ {zone_lbl} &nbsp; 🏷 {fac.facility_category}<br>
-  💊 <b>{fac.rx_summary}</b><br>
-  &nbsp;&nbsp; 院内処方: {fac.inhouse_rx} / 院外処方: {fac.outpatient_rx}<br>
-  👥 外来患者: {op_txt}<br>
-  📅 週診療: <b>{fac.weekly_op_days or '—'}</b> 日<br>
-  🔬 診療科: {fac.specialties or '—'}<br>
-  {('<span style="color:#c2410c">🟠 ' + fac.review_note + '</span><br>') if fac.review_note else ''}
-  {'<a href="' + fac.detail_url + '" target="_blank" style="font-size:11px">🔗 MHLWページ</a>' if fac.detail_url else ''}
-</div>"""
-            folium.Marker([fac.lat, fac.lon], popup=folium.Popup(popup_html, max_width=280),
-                          tooltip=f"🏥 {fac.name}（{(fac.distance_m or 0):,.0f}m / {zone_lbl}）",
-                          icon=folium.Icon(color=color, icon=icon_name, prefix="fa")).add_to(m)
-        for ph in pharmacies:
-            if ph.lat is None or ph.lon is None:
-                continue
-            ph_color = "blue" if ph.pharmacy_type == "門前薬局" else "lightblue"
-            near = (f"{(ph.nearest_clinic_name or '')[:20]}（{ph.nearest_clinic_dist_m:,.0f}m）"
-                    if ph.nearest_clinic_dist_m is not None else "—")
-            ph_popup = f"""
-<div style="min-width:210px;font-family:sans-serif;font-size:13px">
-  <b>💊 {ph.name}</b><br>
-  <span style="color:#64748b;font-size:11px">{ph.address or '—'}</span><br>
-  <hr style="margin:4px 0">
-  📏 <b>{(ph.distance_m or 0):,.0f} m</b><br>
-  🏷 <b>{ph.pharmacy_type}</b><br>
-  🏥 最近接: {near}<br>
-  📋 年間処方箋数: <b>{f"{ph.annual_rx_count:,}枚" if ph.annual_rx_count else "—"}</b><br>
-  {('<span style="color:#c2410c">🟠 ' + ph.review_note + '</span><br>') if ph.review_note else ''}
-  {'<a href="' + ph.detail_url + '" target="_blank" style="font-size:11px">🔗 MHLWページ</a>' if ph.detail_url else ''}
-</div>"""
-            folium.Marker([ph.lat, ph.lon], popup=folium.Popup(ph_popup, max_width=260),
-                          tooltip=f"💊 {ph.name}（{ph.pharmacy_type}）",
-                          icon=folium.Icon(color=ph_color, icon="plus-square", prefix="fa")).add_to(m)
-        st_folium(m, use_container_width=True, height=560)
-        st.markdown(
-            "🟢 院外処方あり　🟤 院内処方のみ　🟣 病院　⚫ 不明　🟠 名簿照合で要確認　🔴 薬局候補地  \n"
-            "🔵 門前薬局　🩵 面薬局  \n"
-            + "　".join(f"{_ZONE_ICONS[i]} Z{i + 1}円" for i in range(len(zones_saved)))
-        )
-
-    with tab_debug:
-        st.subheader("🔬 MHLW取得フィールド詳細")
-        if not show_debug:
-            st.caption("サイドバーの「🔧 全取得フィールドを表示」をONにすると表示します。")
-        else:
-            st.caption("各施設のMHLWページから取得した全フィールドを確認できます。")
-            sel_name = st.selectbox("施設を選択", [f.name for f in results if f.detail_fetched])
-            if sel_name:
-                sel_fac = next((f for f in results if f.name == sel_name), None)
-                if sel_fac and sel_fac.raw_fields:
-                    st.info(f"kikanKbn={sel_fac.kikan_kbn}  |  URL: {sel_fac.detail_url[:80]}...")
-                    st.dataframe(pd.DataFrame([{"フィールド名": k, "値": v}
-                                               for k, v in sel_fac.raw_fields.items()]),
-                                 use_container_width=True, height=400)
-                else:
-                    st.warning("詳細データが取得されていません。")
-
-    with tab_log:
-        st.subheader("🩺 取りこぼし診断")
-        st.caption(st.session_state.od_msg)
-        xc = st.session_state.xcheck or {}
-        xrows = []
-        for grp in ("added", "suspended", "not_in_kb", "merged"):
-            for r in xc.get(grp, []):
-                if r.get("種別") == "薬局" and not st.session_state.searched_ph:
+            apply_ph = st.form_submit_button("🔄 薬局の修正を反映（再計算）", type="primary")
+            st.caption("※ セル入力の直後は1回目のクリックが入力確定に使われることがあります。"
+                       "上の①②の数字が変わらない場合はもう一度押してください。")
+        if apply_ph:
+            pnew = resolve_edit(ped, "薬局", "実績(枚/年)", "rx", precs, c["clat"], c["clon"])
+            auto_men = {r["key"]: r["auto_menkata"] for r in c["classified"]}
+            new_mk = {}
+            for _, row in ped.iterrows():
+                name = str(row.get("薬局") or "").strip()
+                k = row.get("_key")
+                # 手動追加行は _key が空なので、名前から合成キーを作る（pharmacy_keyと一致）
+                k = k if (isinstance(k, str) and k) else (f"name:{name}" if name else None)
+                if not k:
                     continue
-                xrows.append({"内容": r.get("内容", ""), "種別": r.get("種別", ""),
-                              "施設名": r.get("施設名", ""), "距離(m)": r.get("距離(m)"),
-                              "住所": r.get("住所", "")})
+                is_men = (row.get("面/門前") == "面")
+                # 自動判定に無い（＝まだ計算に含まれない手動追加）行は選択を必ず保存。
+                # 既存行は自動と異なるときだけ上書き保存。
+                if k not in auto_men or is_men != auto_men[k]:
+                    new_mk[k] = is_men
+            ph_edit[sel] = pnew
+            mk_all[sel] = new_mk
+            st.session_state.pop(f"ph_edit_{sel}", None)    # ウィジェット状態をクリア＝追加行の重複増殖を防止
+            st.rerun(scope="app")
+
+
+raws = st.session_state.get("multi_raw", [])
+if raws:
+    # 確定済みの手修正（session_state）を反映して計算（編集フォームは fragment で隔離）。
+    computed = [compute_candidate(r) for r in raws]
+
+    st.markdown("#### 2. 比較結果")
+    rows = []
+    for cc in computed:
+        med, foot = cc["med_total"], cc["foot_total"]
+        vals = [v for v in (med, foot) if v is not None]
+        rng = f"{min(vals):,.0f}〜{max(vals):,.0f}" if len(vals) == 2 else "—"
+        rows.append({
+            "ラベル": cc["label"], "店舗名/メモ": cc["name"], "住所": cc["addr"][:24],
+            "① 医療機関(年)": round(med) if med is not None else None,
+            "① 医療機関(月)": round(med / 12) if med is not None else None,
+            "② 集客(年)": round(foot) if foot is not None else None,
+            "② 集客(月)": round(foot / 12) if foot is not None else None,
+            "予測レンジ(年)": rng, "面競合数": cc["comp_n"], "寄与医療機関数": len(cc["huff_rows"]),
+            "🔴要確認": cc["n_alert"], "外来不明": cc["n_unknown_op"],
+        })
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, use_container_width=True,
+        column_config={cn: st.column_config.NumberColumn(cn, format="%d 枚")
+                       for cn in ["① 医療機関(年)", "① 医療機関(月)", "② 集客(年)", "② 集客(月)"]},
+    )
+    ranked = sorted(computed, key=lambda x: (x["foot_total"] if x["foot_total"] is not None
+                                             else (x["med_total"] or 0)), reverse=True)
+    st.success(f"🏆 最大の候補地： **{ranked[0]['label']}**"
+               f"（{ranked[0]['name'] or ranked[0]['addr'][:20]}）")
+
+    # ── 🩺 取りこぼし診断（v1.4で追加） ───────────────────────────────────
+    # 「漏れているかどうか」を目視で確認する前に、機械側で言い切るための欄。
+    # 打ち切り・座標未確定・広域再検索での回収件数を1か所に集約して表示する。
+    _diag = []
+    for _r in raws:
+        _alerts = [l for l in _r.get("log", []) if "⚠️" in l]
+        if _alerts:
+            _diag.append((_r["label"], _r.get("name") or _r["addr"][:20], _alerts))
+    # v2.1: 厚生局名簿との差分（＝目視で確認すべき施設そのもの）
+    _xrows = []
+    for _r in raws:
+        _xc = _r.get("xcheck") or {}
+        for _grp in ("added", "suspended", "not_in_kb", "merged"):
+            for _row in _xc.get(_grp, []):
+                _xrows.append({"候補地": _r["label"], "内容": _row.get("内容", ""),
+                               "種別": _row.get("種別", ""), "施設名": _row.get("施設名", ""),
+                               "距離(m)": _row.get("距離(m)"), "住所": _row.get("住所", "")})
+    _n_diag = sum(len(a) for _, _, a in _diag) + len(_xrows)
+    with st.expander(
+            ("🩺 取りこぼし診断"
+             + (f"（要確認 {_n_diag}件）" if _n_diag else "（問題なし）")),
+            expanded=bool(_diag or _xrows)):
         st.markdown("**① 公式名簿との差分（目視確認はこの表の施設だけで済みます）**")
-        if xrows:
-            st.caption("『名簿のみ』は一覧に自動追加済み、『重複登録を統合』は1件にまとめ済み、"
-                       "『休止』『名簿に無し』は一覧に残したまま🟠を付けています。")
-            st.dataframe(pd.DataFrame(xrows), hide_index=True, use_container_width=True)
+        if _xrows:
+            st.caption("地方厚生局の保険医療機関・保険薬局名簿と、ツールのリスト"
+                       "（公式オープンデータ＋ナビィ＋OSM）の食い違いです。"
+                       "『名簿のみ』はリストに自動追加済み（地図・計算に反映）、"
+                       "『重複登録を統合』は1件にまとめ済み、"
+                       "『休止』『名簿に無し』はリストに残したまま🟠を付けています。"
+                       "実態と違えば各表で削除・修正してください。")
+            st.dataframe(pd.DataFrame(_xrows), hide_index=True, use_container_width=True)
         else:
             st.success("公式名簿との食い違いはありません。")
-        for line in xc.get("status", []):
-            st.caption(f"使用名簿 {line}")
+        for _r in raws:
+            _st = (_r.get("xcheck") or {}).get("status", [])
+            if _st:
+                st.caption(f"{_r['label']}：{_r.get('od_msg', '')}／名簿 " + "／".join(_st))
         st.markdown("**② 取得処理の警告**")
-        alerts = [l for l in st.session_state.search_log if "⚠️" in l and not l.startswith("  ")]
-        if alerts:
-            for a in alerts:
-                st.warning(a)
+        if _diag:
+            st.caption(
+                "以下は「リストが実態より少なくなっている可能性がある箇所」です。"
+                "該当がある候補地だけ、地図やGoogleマップで目視確認してください。"
+            )
+            for _label, _name, _alerts in _diag:
+                st.markdown(f"**{_label}　{_name}**")
+                for _a in _alerts:
+                    st.warning(_a)
         else:
-            st.success("取得処理の警告はありません。")
-        st.divider()
-        st.subheader("検索ログ")
-        for line in st.session_state.search_log:
-            st.text(line)
+            st.success(
+                "取得処理の警告はありません。"
+                "ナビィの総件数ぶんをすべて取得し、座標もすべて確定しています。"
+            )
+        st.caption(
+            "※ 厚生局名簿は毎月更新のため、今月開設したばかりの施設は名簿にも載っていない"
+            "ことがあります。その場合は下の「➕ 漏れた医療機関を追加」から手動で追加してください。"
+        )
+        with st.popover("処理ログ（全文）"):
+            for _r in raws:
+                st.markdown(f"**{_r['label']}　{_r.get('name') or _r['addr'][:20]}**")
+                for _line in _r.get("log", []):
+                    st.text(_line)
 
-elif not run_btn:
-    st.info(
-        "👈 サイドバーに住所とゾーンを入力して「検索実行」を押してください。\n\n"
-        "### 取得データ\n"
-        "| 項目 | 取得方法 |\n"
-        "|------|----------|\n"
-        "| 医療機関名・住所・距離・診療科・診療日 | 厚労省オープンデータ（＋ナビィ・OSM） |\n"
-        "| **院内処方 / 院外処方の有無** | ナビィ「院内処方の有無」「院外処方の有無」 |\n"
-        "| **1日外来患者数** | ナビィ「医療実績、結果に関する事項」（無い場合は参考値を表示） |\n"
-        "| **医師数・漏れの確認** | 地方厚生局「コード内容別医療機関一覧表」 |\n\n"
-        "**データソース**: 厚労省 医療情報ネット（ナビィ）とそのオープンデータ ＋ 地方厚生局 ＋ OpenStreetMap"
+
+    st.markdown("#### 3. 候補地ごとの詳細（ロジックの内訳）")
+    sel = st.selectbox("詳細を見る候補地", [c["label"] for c in computed],
+                       format_func=lambda x: f"{x}　" + next((c["name"] or c["addr"][:16]
+                                                              for c in computed if c["label"] == x), ""))
+    c = next(x for x in computed if x["label"] == sel)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("① 医療機関ベース（ハフ）", f"{c['med_total']:,.0f} 枚/年",
+              f"月 {c['med_total']/12:,.0f} 枚")
+    if c["foot_total"] is not None:
+        m2.metric("② 集客ベース", f"{c['foot_total']:,.0f} 枚/年", f"月 {c['foot_total']/12:,.0f} 枚")
+    else:
+        m2.metric("② 集客ベース", "未入力")
+    m3.metric("面競合数 / 除外", f"{c['comp_n']} / {c['comp_excluded']}")
+
+    # ── 医療機関テーブル（要確認フラグ入り・ここで外来数や診療科を直接修正する） ──
+    render_med_editor(sel, c, int(med_high_thr), int(med_low_thr))
+
+    st.markdown("##### 🗺 商圏マップ（周辺の医療機関・薬局）")
+    show_map = st.checkbox(
+        "地図を表示する（⚠️ 重い処理。**施設の追加・修正が終わってから**オンにしてスクショ推奨）",
+        value=False, key=f"showmap_{sel}",
+        help="地図の再描画は重いので、編集中はオフのままが快適です。オフでも①②の数字・下の内訳表は反映済みです。",
     )
+    if show_map:
+        st.caption("このままスクショしてお客様提示にお使いください。手動で追加・削除・座標修正した施設もそのまま反映されます。"
+                   "★＝候補地／◯＝商圏／青＝診療所・濃青＝病院・紫＝美容／緑＝薬局(面)・橙＝薬局(門前)。"
+                   "マーカーをクリックすると距離・診療科・外来・実績などが表示されます。")
+        st_folium(build_map(c, radius_m), height=540, returned_objects=[],
+                  use_container_width=True, key=f"map_{sel}")
+    else:
+        st.caption("地図はオフ中（編集がサクサク動きます）。編集が終わったら上のチェックをオンにして地図を表示・スクショしてください。")
+
+    st.markdown("##### ① 医療機関ベース：ハフの取り分内訳")
+    st.caption("各クリニックが出す処方箋（原資）を、自店の重み ÷（自店の重み＋競合の重み合計）の"
+               "取り分率で獲得します。合計＝①予測。")
+    _opmap = {facility_key(f): op_display(f) for f in c["med"]}
+    _flmap = c["flags"]
+    hb_df = pd.DataFrame([{
+        "医療機関": row["clinic"], "診療科": row.get("dept", "その他"),
+        "外来(人/日)": _opmap.get(row.get("key"), "—"),
+        "検証": _flmap.get(row.get("key"), ""),
+        "発行率": round(row.get("issue", 0.0), 2), "距離(m)": round(row["dist"]),
+        "年間院外処方(原資)": round(row["pool"]),
+        "自店の重み": round(row["self_w"], 3), "競合の重み合計": round(row["comp_w"], 3),
+        "取り分率": round(row["share"], 3), "獲得(枚/年)": round(row["captured"]),
+    } for row in c["huff_rows"]])
+    st.dataframe(hb_df, hide_index=True, use_container_width=True, column_config={
+        "発行率": st.column_config.NumberColumn("発行率", format="%.2f"),
+        "取り分率": st.column_config.NumberColumn("取り分率", format="%.3f"),
+        "獲得(枚/年)": st.column_config.NumberColumn("獲得(枚/年)", format="%d 枚"),
+    })
+
+    if c["foot"]:
+        st.markdown("##### ② 集客ベース：内訳")
+        exp_all = st.session_state.setdefault("exp_multi", {})
+        new_exp = st.number_input(
+            f"周知率（{sel}）— 館の来店客のうち薬局に接触する割合", 0.0, 1.0,
+            float(c["exposure"]), 0.05, format="%.2f", key=f"exp_{sel}",
+            help="食品スーパー=1.0／大型モール1階・主動線=0.3／上層階・動線外=0.1。変更すると②が再計算されます。",
+        )
+        if abs(new_exp - c["exposure"]) > 1e-9:
+            exp_all[sel] = new_exp
+            st.rerun()
+        fo, fp = c["foot"], c["fp"]
+        st.markdown(
+            f"- 館の来店客数 {c['uni']:,.0f}人 × **周知率 {c['exposure']:.2f}** = 有効客数 **{c['eff_uni']:,.0f}人**"
+            f"（65+ {fo['u65']:,.0f} / 65− {fo['u_under']:,.0f}）\n"
+            f"- 年間受診延べ {fo['annual_visits']:,.0f}回 → 院外処方プール {fo['rx_pool']:,.0f}枚\n"
+            f"- 利用率 {fp.use_rate:.1%} ÷ (面競合の実効パワー {c['comp_power']:.1f}"
+            f"〔面{c['comp_n']}店・距離減衰λ={fp.competitor_decay_m:.0f}m〕 + 1) = シェア {fo['share']:.2%}\n"
+            f"- **獲得 = {fo['total']:,.0f} 枚/年**"
+        )
+
+    # ── 薬局側の確認・修正 ────────────────────────────────────────────────
+    st.markdown("##### 🔧 薬局の確認・修正")
+    st.caption("💡 追加・修正は**何行でも続けて**行えます。終わったら **「反映して再計算」** を押すと、"
+               "上の①②予測とマップに反映されます。")
+    render_ph_editor(sel, c)
+
+    # ── 4. Excel ─────────────────────────────────────────────────────────────
+    st.markdown("#### 4. Excelで書き出し")
+    st.caption("集客シートは客数・競合・係数、医療機関シートは原資・重みを編集すると、"
+               "獲得枚数がExcelの数式で自動再計算されます（ブラウザを閉じても手元で編集可能）。"
+               "v1.3で **RAW_医療機関 / RAW_薬局**（1日外来患者数・出典・🔴要確認フラグ入りの生データ）と "
+               "**お客様提示用** シートを追加しました。")
+    _d1, _d2 = st.columns(2)
+    with _d1:
+        st.download_button(
+            "📊 社内用Excel（数式＋RAWデータ）",
+            data=build_excel(computed), file_name="処方箋予測_複数店舗比較_社内用.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary", use_container_width=True,
+        )
+        st.caption("シート構成：お客様提示用／比較サマリー／集客_／医療機関_／RAW_医療機関／RAW_薬局。"
+                   "🔴要確認の行は赤字＋赤セルで着色。")
+    with _d2:
+        st.download_button(
+            "🤝 お客様提示用Excel（機密を含まない）",
+            data=build_excel_client(computed), file_name="処方箋予測_ご提案資料.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.caption("院外処方率・発行率・利用率・距離減衰λ・門前ブースト等の"
+                   "**自社アサンプションは一切含みません**。予測枚数と、ナビィ等の公開情報"
+                   "（周辺の医療機関・薬局の一覧）のみ。")
+    st.error("🔴 お客様にお渡しするのは必ず **右の「お客様提示用Excel」** です。"
+             "社内用には機密のアサンプションが含まれます。")
