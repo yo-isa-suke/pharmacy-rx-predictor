@@ -1748,7 +1748,9 @@ def _read_json(path: Path) -> dict:
 def _write_json(path: Path, obj: dict) -> None:
     _ensure_data_dir()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _is_stale(iso_ts: Optional[str], days: int) -> bool:
@@ -1932,7 +1934,8 @@ def od_build(date: str, urls: Dict[str, str], note=None) -> Path:
     allf = allf[allf["lat"].between(20.0, 46.5) & allf["lon"].between(122.0, 154.5)]
     _ensure_data_dir()
     path = DATA_DIR / f"opendata_{date}.csv.gz"
-    tmp = path.with_suffix(".tmp")
+    # 別タブ（別セッション）が同時に作っても壊れないよう、一時ファイル名を処理ごとに分ける
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     allf.to_csv(tmp, index=False, compression="gzip")
     tmp.replace(path)
     for old in DATA_DIR.glob("opendata_*.csv.gz"):     # 古い版は消す（最新1版だけ保持）
@@ -2352,7 +2355,9 @@ def _kb_paths(slug: str, kind: str) -> Tuple[Path, Path]:
 def kb_store(slug: str, kind: str, df: pd.DataFrame, meta: dict) -> None:
     p, m = _kb_paths(slug, kind)
     p.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(p, index=False, compression="gzip")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")   # 同時書き込み対策
+    df.to_csv(tmp, index=False, compression="gzip")
+    tmp.replace(p)
     _write_json(m, meta)
 
 
